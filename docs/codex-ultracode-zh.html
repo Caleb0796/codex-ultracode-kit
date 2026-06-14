@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Codex Ultracode 技能详解 · 与 Claude Ultracode 差距分析</title>
+<style>
+  :root{
+    --bg:#0f1216; --panel:#171b21; --panel2:#1d222a; --line:#2a313b;
+    --fg:#e7ecf2; --muted:#9aa6b5; --dim:#6b7787;
+    --accent:#4fd1c5; --accent2:#7c9cff; --warn:#f6c560; --bad:#ef6f6f; --good:#5fd28a;
+    --code:#0b0e12; --mono:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,"PingFang SC","Microsoft YaHei","Noto Sans CJK SC",Segoe UI,Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);
+       line-height:1.75;font-size:16px;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+  header.hero{padding:64px 0 40px;border-bottom:1px solid var(--line);
+    background:radial-gradient(1200px 400px at 20% -10%,rgba(79,209,197,.10),transparent 60%),
+               radial-gradient(900px 360px at 90% -20%,rgba(124,156,255,.10),transparent 60%);}
+  .kick{font-family:var(--mono);font-size:13px;letter-spacing:.18em;color:var(--accent);text-transform:uppercase}
+  h1{font-size:38px;line-height:1.25;margin:14px 0 10px;font-weight:760;letter-spacing:-.01em}
+  h1 .g{background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .sub{color:var(--muted);font-size:17px;max-width:760px}
+  .meta{margin-top:20px;display:flex;gap:10px;flex-wrap:wrap}
+  .pill{font-family:var(--mono);font-size:12px;color:var(--muted);background:var(--panel2);
+    border:1px solid var(--line);border-radius:999px;padding:5px 12px}
+  nav.toc{position:sticky;top:0;z-index:5;background:rgba(15,18,22,.86);backdrop-filter:blur(10px);
+    border-bottom:1px solid var(--line);padding:12px 0}
+  nav.toc .wrap{display:flex;gap:8px;flex-wrap:wrap}
+  nav.toc a{font-size:13px;color:var(--muted);text-decoration:none;padding:5px 11px;border-radius:7px;border:1px solid transparent}
+  nav.toc a:hover{color:var(--fg);background:var(--panel2);border-color:var(--line)}
+  section{padding:46px 0;border-bottom:1px solid var(--line)}
+  h2{font-size:26px;margin:0 0 6px;font-weight:720;letter-spacing:-.01em;display:flex;align-items:center;gap:12px}
+  h2 .num{font-family:var(--mono);font-size:15px;color:var(--accent);border:1px solid var(--line);
+    border-radius:8px;padding:2px 9px;background:var(--panel)}
+  h3{font-size:18px;margin:30px 0 10px;font-weight:680;color:var(--fg)}
+  .lead{color:var(--muted);margin:8px 0 20px;max-width:820px}
+  p{margin:12px 0;color:#cdd6e1}
+  .grid{display:grid;gap:16px}
+  .g2{grid-template-columns:repeat(2,1fr)} .g3{grid-template-columns:repeat(3,1fr)}
+  @media(max-width:760px){.g2,.g3{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px}
+  .card h4{margin:0 0 8px;font-size:16px;font-weight:680}
+  .card .tag{font-family:var(--mono);font-size:12px;color:var(--accent2)}
+  .card p{margin:6px 0;font-size:14.5px;color:var(--muted)}
+  code{font-family:var(--mono);font-size:.88em;background:var(--panel2);border:1px solid var(--line);
+    border-radius:5px;padding:1px 6px;color:#d7e3ff}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:12px;padding:16px 18px;overflow:auto;margin:14px 0}
+  pre code{background:none;border:none;padding:0;color:#cfe3df;font-size:13.5px;line-height:1.7;display:block;white-space:pre}
+  .cmt{color:#5f6b78}
+  table{width:100%;border-collapse:collapse;margin:18px 0;font-size:14.5px}
+  th,td{text-align:left;padding:11px 13px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:620;font-size:13px;letter-spacing:.03em;background:var(--panel)}
+  tbody tr:hover{background:var(--panel2)}
+  td .f{font-weight:640;color:var(--fg)}
+  .badge{font-family:var(--mono);font-size:11.5px;font-weight:700;padding:3px 9px;border-radius:999px;
+    white-space:nowrap;display:inline-block}
+  .b-ok{color:#0c1a12;background:var(--good)} .b-fill{color:#10231a;background:#7fe0b6}
+  .b-part{color:#231c08;background:var(--warn)} .b-gap{color:#2a0d0d;background:var(--bad)}
+  .b-div{color:#0c1626;background:var(--accent2)}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;margin:6px 0 4px}
+  .legend span{display:flex;align-items:center;gap:7px;font-size:13px;color:var(--muted)}
+  .note{border-left:3px solid var(--accent);background:var(--panel2);border-radius:0 10px 10px 0;padding:14px 18px;margin:18px 0}
+  .note.warn{border-color:var(--warn)} .note.bad{border-color:var(--bad)}
+  .note b{color:var(--fg)}
+  ul{margin:10px 0;padding-left:22px} li{margin:7px 0;color:#cdd6e1}
+  .kv{display:grid;grid-template-columns:160px 1fr;gap:6px 18px;font-size:14.5px;margin:12px 0}
+  .kv dt{color:var(--accent);font-family:var(--mono);font-size:13px}
+  .kv dd{margin:0;color:#cdd6e1}
+  .flow{display:flex;align-items:stretch;gap:0;flex-wrap:wrap;margin:18px 0}
+  .step{flex:1;min-width:150px;background:var(--panel);border:1px solid var(--line);padding:14px 16px;position:relative}
+  .step:first-child{border-radius:12px 0 0 12px}.step:last-child{border-radius:0 12px 12px 0}
+  @media(max-width:760px){.step{border-radius:12px!important;min-width:100%}}
+  .step .n{font-family:var(--mono);font-size:12px;color:var(--accent)}
+  .step .t{font-weight:660;font-size:15px;margin:3px 0}
+  .step .d{font-size:13px;color:var(--muted)}
+  footer{padding:40px 0 70px;color:var(--dim);font-size:13.5px}
+  .stat{display:flex;gap:26px;flex-wrap:wrap;margin:8px 0}
+  .stat div b{font-size:24px;color:var(--accent);font-family:var(--mono);display:block}
+  .stat div span{font-size:12.5px;color:var(--muted)}
+  .tier{font-family:var(--mono);font-size:11px;color:var(--dim)}
+</style>
+</head>
+<body>
+
+<header class="hero"><div class="wrap">
+  <div class="kick">OpenAI Codex CLI · 多智能体编排</div>
+  <h1>Codex <span class="g">Ultracode</span> 技能详解<br>与 Claude Ultracode 的差距分析</h1>
+  <p class="sub">把 Claude Code 的「数十个并行智能体」能力移植到 Codex CLI 的完整方案：技能、对抗式验证角色、配置上限、外部确定性编排器，以及逐项核实过的差距清单。</p>
+  <div class="meta">
+    <span class="pill">Codex CLI 0.125.0</span>
+    <span class="pill">macOS · 12 核</span>
+    <span class="pill">模型 gpt-5.5</span>
+    <span class="pill">核实日期 2026-06-13</span>
+  </div>
+</div></header>
+
+<nav class="toc"><div class="wrap">
+  <a href="#why">核心洞察</a>
+  <a href="#parts">已安装组件</a>
+  <a href="#trigger">触发与门控</a>
+  <a href="#layers">三层架构</a>
+  <a href="#patterns">质量模式</a>
+  <a href="#limits">配置与上限</a>
+  <a href="#env">环境约束</a>
+  <a href="#gap">差距对照表</a>
+  <a href="#lessons">验证记录</a>
+</div></nav>
+
+<div class="wrap">
+
+<!-- 1 -->
+<section id="why">
+  <h2><span class="num">01</span>核心洞察：为什么不能只靠提示词</h2>
+  <p class="lead">这是整套方案的前提，也是 Codex 与 Claude 最根本的差别。</p>
+  <p>Claude Code 的「几十个智能体」<b>并非模型自己决定生成的</b>，而是来自一个确定性脚本（Workflow 工具）——由<b>外层程序</b>用 <code>parallel()</code> / <code>pipeline()</code> 循环决定并发数量。Codex 的原生 <code>spawn_agent</code> 恰好相反：<b>由模型驱动，且被训练得很保守</b>。官方文档明确写着「Codex 仅在用户明确要求时才生成智能体」，典型示例只生成 2–6 个。</p>
+  <div class="note"><b>结论：</b>无论怎么写提示词，都无法稳定让 Codex 模型生成几十个智能体——少生成是「设计如此」，不是 bug。要逼近 Claude 的规模，必须把并发数量握在<b>外层脚本</b>手里，用 <code>codex exec</code> 作为单个智能体的原语。这就是 <code>codex_workflow.py</code> 的全部思路。</p>
+</section>
+
+<!-- 2 -->
+<section id="parts">
+  <h2><span class="num">02</span>已安装组件</h2>
+  <div class="grid g2">
+    <div class="card">
+      <div class="tag">~/.codex/skills/ultracode/SKILL.md</div>
+      <h4>Ultracode 技能</h4>
+      <p>会话内编排手册：侦察 → 拆分 → 扇出（<code>spawn_agent</code> / <code>spawn_agents_on_csv</code>）→ 对抗式验证 → 综合。包含角色选择、波次处理、并发槽位回收纪律。</p>
+    </div>
+    <div class="card">
+      <div class="tag">~/.codex/agents/skeptic.toml</div>
+      <h4>Skeptic 对抗验证角色</h4>
+      <p>只读沙箱的「怀疑者」自定义角色：默认尝试<b>推翻</b>结论而非确认；裁决为 <code>CONFIRMED / REFUTED / UNVERIFIABLE</code>，沙箱拦截不算推翻。</p>
+    </div>
+    <div class="card">
+      <div class="tag">~/.codex/config.toml → [agents]</div>
+      <h4>并发配置</h4>
+      <p><code>max_threads = 16</code>（默认仅 6）。提升了会话内并发上限，并避免开启 <code>multi_agent_v2</code>（会反而降到约 3）。</p>
+    </div>
+    <div class="card">
+      <div class="tag">codex_workflow.py · codex_patterns.py</div>
+      <h4>外部确定性编排器</h4>
+      <p>Workflow 工具的 Python 移植：<code>agent()</code>/<code>parallel()</code>/<code>pipeline()</code> + 质量模式库。并发由你设定，可达数十个。</p>
+    </div>
+  </div>
+</section>
+
+<!-- 3 -->
+<section id="trigger">
+  <h2><span class="num">03</span>触发方式与门控</h2>
+  <p class="lead">Codex 的「明确要求才生成」是一道硬门控；关键词就是用来满足它的。</p>
+  <div class="kv">
+    <dt>触发词</dt><dd>消息中出现独立单词 <code>ultra</code>（非 <code>ultrasound</code> 之类的子串）或 <code>ultracode</code> → 视为「明确要求并行子智能体」，技能启动。</dd>
+    <dt>自然语言</dt><dd>不用关键词、直接说「用并行子智能体…」「派一个 skeptic 去验证…」同样满足原生门控。</dd>
+    <dt>默认行为</dt><dd>两者都没有 → 单智能体独立完成（成本控制保证：无关键词不扇出）。</dd>
+  </div>
+  <div class="note warn"><b>已修正的坑：</b>技能描述最初会在「做个全面 review」这类<b>无关键词</b>请求上自我授权扇出，与原生门控冲突。已收紧为仅在关键词或明确的多智能体请求时触发。</div>
+</section>
+
+<!-- 4 -->
+<section id="layers">
+  <h2><span class="num">04</span>三层架构：按规模选工具</h2>
+  <p class="lead">不是一个旋钮，而是三条路径，并发能力依次递增。</p>
+  <table>
+    <thead><tr><th>层级</th><th>工具</th><th>并发上限</th><th>适用</th></tr></thead>
+    <tbody>
+      <tr><td><span class="f">会话内 · 模型协调</span></td><td><code>spawn_agent</code>（Ultracode 技能）</td><td>受 <code>max_threads</code> 限制（默认 6 → 已设 16）</td><td>2–6 个异构子任务，模型自己协调与综合</td></tr>
+      <tr><td><span class="f">会话内 · 同质批量</span></td><td><code>spawn_agents_on_csv</code></td><td><code>min(请求值, 64, max_threads)</code></td><td>「对这 N 个文件各做 X」——数据驱动，绕过模型保守性</td></tr>
+      <tr><td><span class="f">外部 · 确定性</span></td><td><code>codex_workflow.py</code></td><td><b>你设定的 N</b>（受 API 限流 / 内存约束）</td><td>真正的数十个智能体，确定性扇出</td></tr>
+    </tbody>
+  </table>
+  <div class="note"><b>关键事实：</b><code>spawn_agents_on_csv</code> 的「16 并发」会被 <code>max_threads</code> 卡住——默认 <code>max_threads=6</code> 时，即使 CSV 请求 64 也只跑 6 个。所以提升 <code>max_threads</code> 是前提。</div>
+</section>
+
+<!-- 5 -->
+<section id="patterns">
+  <h2><span class="num">05</span>质量模式（Ultracode 的「方法论」）</h2>
+  <p class="lead">引擎只是并发；让它成为「ultracode」而非「并行 map」的，是这些模式。已在 <code>codex_patterns.py</code> 中实现。</p>
+  <div class="grid g2">
+    <div class="card"><h4>对抗式验证 adversarial_verify</h4><p>对每条结论生成 N 个 skeptic，各自从不同视角（正确性 / 安全 / 可复现）尝试<b>推翻</b>，多数通过才保留。自己给自己打分是表演——独立性才是关键。</p></div>
+    <div class="card"><h4>评审团 judge_panel</h4><p>从不同角度独立产出 N 个方案，再由裁判智能体打分、择优综合。解空间宽时优于「一稿反复改」。</p></div>
+    <div class="card"><h4>循环到枯竭 loop_until_dry</h4><p>对未知规模的发现（bug、边界情形）反复跑，跨轮去重，连续若干轮无新增才停。固定次数会漏掉长尾。</p></div>
+    <div class="card"><h4>完整性批判 completeness_critic</h4><p>结束前重读原始需求，把每条明确要求映射到对应产出——未映射即「未完成」。修的是检索遗漏，不是自我评价。</p></div>
+    <div class="card"><h4>两段式评审 two-stage review</h4><p>写码单元先查「规格符合」（漏了什么 / 多做了什么 / 误解了什么），再查代码质量。规格不过不进质量评审。</p></div>
+    <div class="card"><h4>波次 + 槽位回收</h4><p>单元多于并发上限时分波处理：生成到上限 → 等待 → 读结果并立即 <code>close_agent</code> 回收槽位 → 下一波。</p></div>
+  </div>
+</section>
+
+<!-- 6 -->
+<section id="limits">
+  <h2><span class="num">06</span>配置与上限（已对照 Rust 源码核实）</h2>
+  <div class="kv">
+    <dt>max_threads</dt><dd>默认 <b>6</b>；唯一校验是「≥1」，<b>无上限钳制</b>——可设 16/32/64，逐字生效（仅限 V1 多智能体路径，本机即是）。这是会话内树范围的<b>并发存活</b>上限。</dd>
+    <dt>CSV 硬上限</dt><dd><code>spawn_agents_on_csv</code> 每作业最多 <b>64</b> 并发（<code>MAX_AGENT_JOB_CONCURRENCY</code>），且再被 <code>max_threads</code> 钳制。超过 64 无意义。</dd>
+    <dt>槽位泄漏</dt><dd>已完成但未 <code>close_agent</code> 的智能体<b>仍占用槽位</b>，长程波次不回收会中途撞限。</dd>
+    <dt>multi_agent_v2</dt><dd>处于开发中且关闭。<b>不要开启</b>——它会拒绝 <code>max_threads</code> 并把上限降到约 3。</dd>
+    <dt>实际瓶颈</dt><dd>账号级 API 限流（TPM/RPM）与本机内存，远早于任何配置数字。官方默认正是从 64 降到 16 以避免限流。</dd>
+  </div>
+  <pre><code><span class="cmt"># ~/.codex/config.toml —— 当前已写入</span>
+[agents]
+max_threads = 16   <span class="cmt"># 默认 6；可升至 32/64，spawn_agent 路径无硬上限</span></code></pre>
+  <div class="stat">
+    <div><b>6 → 16</b><span>会话内并发上限（已提升）</span></div>
+    <div><b>64</b><span>CSV 每作业硬上限</span></div>
+    <div><b>∞*</b><span>spawn_agent 无硬上限（*受限流）</span></div>
+    <div><b>8 / 22s</b><span>外部编排器实测并发（已验证）</span></div>
+  </div>
+</section>
+
+<!-- 7 -->
+<section id="env">
+  <h2><span class="num">07</span>环境约束（两个工具都改不了）</h2>
+  <div class="note bad"><b>云策略强制审批：</b>本账号的云端策略把审批强制为 <code>OnRequest</code>，<code>-a never</code> 被静默降级。后果——编排出的智能体<b>能改文件</b>（沙箱内写入无需审批），但<b>不能跑 shell 命令</b>（测试/构建在 exec 模式下被自动拒绝：<i>"command execution approval is not supported in exec mode"</i>）。</div>
+  <p>因此写码智能体被要求<b>只改文件</b>，而<b>验证（跑测试）必须放到编排器里</b>、在收集 diff 之后执行——这本来也是更合理的分工。另外 worktree 内 <code>git add -A</code> 会带进无关的未跟踪文件（如 SCM 日志），应用 diff 时要限定到目标路径。</p>
+</section>
+
+<!-- 8 GAP TABLE -->
+<section id="gap">
+  <h2><span class="num">08</span>Codex vs Claude Ultracode 差距对照</h2>
+  <p class="lead">逐项对照（由两个对抗审计智能体核实）。引擎与方法论已对齐；三项<b>无法复刻</b>的属于 Claude Code 宿主层能力，Codex 的 <code>codex exec</code> 不暴露。</p>
+  <div class="legend">
+    <span><i class="badge b-ok">对齐</i> 语义一致</span>
+    <span><i class="badge b-fill">已补齐</i> 经审计后补上</span>
+    <span><i class="badge b-part">部分</i> 近似/弱化</span>
+    <span><i class="badge b-div">有意偏离</i> 设计取舍</span>
+    <span><i class="badge b-gap">无法复刻</i> 宿主层能力</span>
+  </div>
+  <table>
+    <thead><tr><th style="width:24%">能力</th><th style="width:14%">状态</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td class="f">agent / parallel / pipeline</td><td><span class="badge b-ok">对齐</span></td><td>屏障型 parallel（失败→None）、无屏障 pipeline（逐项链、<code>(prev,item,index)</code> 阶段签名、抛错→None）语义一致。</td></tr>
+      <tr><td class="f">schema 结构化输出</td><td><span class="badge b-ok">对齐</span></td><td>Codex <code>--output-schema</code> 服务端强制；编排器再加 <code>jsonschema</code> 校验 + 不符重试。需 <code>additionalProperties:false</code>（已自动注入）。</td></tr>
+      <tr><td class="f">质量模式（验证/评审团/枯竭/批判）</td><td><span class="badge b-fill">已补齐</span></td><td><code>codex_patterns.py</code> 完整移植——这是「ultracode」与「并行 map」的分水岭。</td></tr>
+      <tr><td class="f">worktree 隔离（并行写者）</td><td><span class="badge b-fill">已补齐</span></td><td>每个写者独立 worktree，返回 diff；重试不泄漏、清理 worktree+分支。<b>已实测：2 写者互不冲突。</b></td></tr>
+      <tr><td class="f">budget 令牌上限</td><td><span class="badge b-fill">已补齐</span></td><td><code>CODEX_WF_BUDGET</code> 超限即 <code>BudgetExceeded</code>（原本只是只读计量）。</td></tr>
+      <tr><td class="f">log() 进度叙述</td><td><span class="badge b-part">部分</span></td><td>有 <code>log()</code> 平铺输出到 stderr；无 <code>phase()</code> 分组、无实时进度树。</td></tr>
+      <tr><td class="f">role / agentType</td><td><span class="badge b-part">部分</span></td><td>会话内有 explorer/worker/skeptic 角色；外部编排器以提示词框定角色（<code>codex exec</code> 无子智能体角色选择）。</td></tr>
+      <tr><td class="f">MCP 工具访问</td><td><span class="badge b-div">有意偏离</span></td><td>Workflow 智能体可用会话 MCP；本编排器默认 <code>-c mcp_servers={}</code> 跑「干净」环境以求快与确定。注：该参数只能部分抑制已配置服务器（仍会尝试连接）。</td></tr>
+      <tr><td class="f">并发模型</td><td><span class="badge b-div">有意偏离</span></td><td>Claude：<code>min(16, 核数-2)</code> 由宿主调度，模型不介入。Codex 会话内：模型驱动 + <code>max_threads</code> 上限（默认 6）。外部编排器：由你设定，与模型脱钩。</td></tr>
+      <tr><td class="f">resume / 缓存（resumeFromRunId）</td><td><span class="badge b-gap">无法复刻</span></td><td>每次重跑全部智能体，无「未变前缀复用缓存」。长程迭代最大的缺口。变通：自建 prompt 内容哈希磁盘缓存（仅只读智能体）。</td></tr>
+      <tr><td class="f">后台执行 + 实时进度</td><td><span class="badge b-gap">无法复刻</span></td><td>Workflow 立即返回 runId、后台运行、<code>/workflows</code> 实时树、完成通知。Python 脚本是阻塞的；最接近的是 <code>nohup … &</code> + tail <code>log()</code>。</td></tr>
+      <tr><td class="f">嵌套 workflow() / args / 生命周期上限</td><td><span class="badge b-gap">无法复刻</span></td><td>Workflow 有内联子工作流、JSON args、1000 总量 / 4096 单批上限。Python 侧用普通函数与 argv 替代（非阻塞缺口），但无运行时上限保护。</td></tr>
+    </tbody>
+  </table>
+  <div class="note"><b>一句话总结：</b>引擎（agent/parallel/pipeline/schema）<b>很相似</b>，方法论（质量模式）<b>已补齐</b>；真正补不上的是 <b>resume 缓存</b>、<b>实时后台进度 UI</b>、<b>智能体级 MCP</b>——它们来自 Claude Code 的宿主，而非 <code>codex exec</code> 能提供的东西。</div>
+</section>
+
+<!-- 9 -->
+<section id="lessons">
+  <h2><span class="num">09</span>验证记录：「看起来对」≠「真的对」</h2>
+  <p class="lead">本方案每一项「能用」都经过实跑验证。以下是被测试揪出、随后修复的真实缺陷。</p>
+  <ul>
+    <li><b>管道缓冲死锁：</b>编排器在 2 个智能体时通过、8 个时全部超时。对照实验证明 Codex 本身 8 并发正常（约 22s），缺陷在我的代码——<code>capture_output=True</code> 用管道，<code>codex exec</code> 输出量大塞满 ~64KB 管道缓冲导致 <code>subprocess.run</code> 死锁。<b>修复：</b>子进程输出重定向到文件，绝不用管道。</li>
+    <li><b>schema 假校验：</b>原本只用贪婪正则 <code>{.*}</code> 取 JSON、<b>不做任何校验</b>，错误形状会静默通过。<b>修复：</b>平衡括号解析 + <code>jsonschema</code> 校验 + 不符重试。</li>
+    <li><b>worktree 泄漏 + 写者挂起：</b>并行写者测试挂起并生成 4 个 worktree（2 智能体 × 2 重试）。根因是 exec 模式拒绝命令审批 + 重试路径泄漏 worktree/分支。<b>修复：</b>写者「只改文件」、重试前先清理、退出时连分支一起删——重测通过。</li>
+    <li><b>六智能体硬上限：</b>原生 <code>spawn_agent</code> 撞到 <code>AgentLimitReached</code>。根因是 <code>max_threads</code> 默认 6。<b>修复并实测：</b><code>-c agents.max_threads=16</code> 下 8 个子智能体全部完成、无报错，随后写入配置。</li>
+  </ul>
+  <div class="note warn"><b>诚实的保留：</b>提升 <code>max_threads</code> 解除了<b>硬上限</b>，但模型仍被训练得保守——16 是上限不是承诺。要可靠的大规模扇出，外部 <code>codex_workflow.py</code>（数量由你定）仍是更可靠的路径。</div>
+</section>
+
+</div>
+
+<footer><div class="wrap">
+  生成于 2026-06-13 · Codex CLI 0.125.0 · 本机实测核实。配置改动针对<b>新</b>会话生效；正在运行的会话需重启。完整可运行代码见 <code>codex_workflow.py</code> / <code>codex_patterns.py</code>，说明见 <code>workflow-in-codex.md</code>。
+</div></footer>
+
+</body>
+</html>

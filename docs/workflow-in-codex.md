@@ -1,0 +1,104 @@
+# Simulating Claude Code's Workflow tool in Codex
+
+## The core insight (verified against Codex's Rust source)
+
+Claude Code's "dozens of agents" do **not** come from the model deciding to spawn them. They come from a deterministic script — `parallel()` / `pipeline()` loops where the *harness* picks the concurrency number. Codex's in-session `spawn_agent` is the opposite: **model-driven and trained to be conservative.** The official docs say "Codex only spawns a new agent when you explicitly ask," and the canonical examples spawn 2-6. No prompt wording reliably gets you to dozens, because under-spawning is intended behavior, not a bug.
+
+So you don't simulate the Workflow tool with config or prompting. You simulate it with an **external orchestrator that holds the concurrency number in code** and uses `codex exec` as the agent primitive. That removes the model from the fan-out decision entirely.
+
+## The mapping
+
+| Workflow tool | Codex equivalent |
+|---|---|
+| `agent(prompt)` → text | `codex exec "prompt" -o out.txt` → read out.txt |
+| `agent(prompt, {schema})` → validated object | `codex exec ... --output-schema s.json -o out.txt` → parse |
+| `parallel(thunks)` (barrier, ~16 concurrent) | thread pool of N `codex exec` processes |
+| `pipeline(items, s1, s2)` (no barrier) | per-item chains in the pool |
+| concurrency cap min(16, cores-2) | your `N` (xargs -P N / pool max_workers) |
+| worktree isolation for writers | `git worktree add` per task |
+
+## The harness — `codex_workflow.py` (verified working)
+
+A near-direct port of the Workflow API. `agent()` / `parallel()` / `pipeline()` with the same semantics, backed by `codex exec` subprocesses and a `ThreadPoolExecutor`.
+
+```python
+import codex_workflow as wf
+res = wf.parallel([lambda: wf.agent("...", schema=S), lambda: wf.agent("...", schema=S)])
+```
+
+Knobs via env: `CODEX_WF_CONCURRENCY` (default 8), `CODEX_WF_MODEL`, `CODEX_WF_EFFORT`, `CODEX_WF_CWD`, `CODEX_WF_TIMEOUT`.
+
+**Verified on this machine (Codex 0.125.0, 2026-06-13):**
+- 2 parallel schema agents → `[{'answer': 42}, {'answer': 72}]` — PASS
+- 8 agents at concurrency 8, each schema-validated → `[1,4,9,16,25,36,49,64]` in 22s — PASS
+- 2 parallel **writer** agents in isolated worktrees → each edited only its own file, no collision, worktrees+branches cleaned up — PASS
+
+This took a real bug fix to reach. The harness passed at 2 agents but hung at 8. Control tests proved Codex itself runs 8 concurrent `codex exec` fine (~22s), isolating the bug to the harness: `subprocess.run(capture_output=True)` pipes stdout/stderr, and `codex exec` emits enough banner/progress text that under concurrency the ~64KB OS pipe buffers fill and `subprocess.run` deadlocks. **Fix: redirect child output to a file, never a pipe** (the result comes from `-o` anyway). If you hand-roll your own orchestrator, do the same — this is the trap that makes "works at 2, hangs at 8."
+
+### Four real bugs found and fixed during testing
+
+These are `codex exec` gotchas the harness now handles; you'd hit all of them hand-rolling it:
+
+1. **`-a never` is a GLOBAL flag.** `codex exec -a never` → `error: unexpected argument '-a' found`. Must be `codex -a never exec ...`. (Note: a cloud-managed policy on your account overrides it to `OnRequest` regardless — read-only sandbox runs fine anyway.)
+2. **Strict schema.** OpenAI structured output requires `"additionalProperties": false` and all properties in `required` on *every* object, or you get `400 invalid_json_schema`. The harness auto-injects both — you write a normal JSON Schema.
+3. **MCP slows/breaks exec.** Every `codex exec` boots your configured MCP servers — startup cost × N agents, and `--output-schema` can misbehave when any MCP server is active. The harness passes `-c mcp_servers={}` to run clean.
+4. **`wait -n` needs bash ≥4.3; macOS ships 3.2.** That's why the harness uses a Python thread pool, not bash job control.
+
+## When to use which of the three layers
+
+| Need | Tool | Concurrency |
+|---|---|---|
+| In-session, model coordinates, 2-6 agents | ultracode skill (`spawn_agent`) | capped by `[agents] max_threads` (default **6**) |
+| In-session homogeneous fan-out | `spawn_agents_on_csv` | min(max_concurrency≤64, **max_threads**) |
+| **Dozens of agents, deterministic** | **`codex_workflow.py` (external)** | **your N** — bounded by CPU/RAM + API rate limits, not the model |
+
+### Raise the in-session ceiling too (optional)
+
+Your `~/.codex/config.toml` has no `[agents]` section, so you're on `max_threads = 6`. Critically, **`spawn_agents_on_csv` is clamped to `max_threads`** — even CSV fan-out tops out at 6 right now. To lift both:
+
+```toml
+[agents]
+max_threads = 16        # default 6; no hard upper cap (honored verbatim). caps CONCURRENT live agents tree-wide
+max_depth = 1           # default 1; raise only if you want agents that spawn agents (recursion ≠ more concurrency)
+# job_max_runtime_seconds = 3600   # default 1800s per CSV worker
+```
+Note: completed agents keep their thread slot until `close_agent` (a known leak, #22779), so the skill must close finished agents to reclaim slots. And don't enable `multi_agent_v2` — it rejects `max_threads` and caps lower.
+
+But even at `max_threads = 16`, in-session spawning stays model-conservative. For genuine "10s of agents," use the external harness — that's the real Workflow-tool equivalent.
+
+## Bash alternative (no Python)
+
+For embarrassingly-parallel batches, GNU `parallel` or `xargs -P N` driving `codex exec`:
+
+```bash
+# per-file review, 8 concurrent, read-only
+ls src/**/*.ts | xargs -P 8 -I{} \
+  codex -a never -s read-only exec --skip-git-repo-check -c 'mcp_servers={}' \
+  "Review {} and write findings to {}.review"
+```
+
+For parallel *writers*, give each task its own git worktree (so they don't collide on the index), pre-install deps in the orchestrator, and assign a unique port per worktree. Route all dependency/lockfile/migration changes through a single coordinator task — those are globally ordered and will conflict.
+
+## Parity with Claude ultracode — what matches, what's filled, what can't be
+
+An adversarial audit compared this harness feature-by-feature against the real Workflow tool. Verdict: the **engine and methodology now match; three harness-level features cannot be replicated with `codex exec`.**
+
+**Matched (core — the load-bearing 80%):** `agent` / `parallel` (barrier, allSettled→None) / `pipeline` (no barrier, `(prev,item,index)` stages, throw→None) / schema-validated structured output / concurrency cap. Plus `codex_patterns.py` ports the ultracode *methodology*: `adversarial_verify` (N skeptics refute, majority survives), `judge_panel`, `loop_until_dry`, `completeness_critic`, `review_then_verify`. The patterns are what make it "ultracode" rather than a parallel `map`.
+
+**Filled after the audit caught them as defects in this harness:**
+- **Worktree isolation** for parallel writers — fresh worktree per agent, returns the diff; leak-proof on retry; cleans up worktrees *and* branches. (Verified: 2 writers, no collision.)
+- **Real schema validation** — was a buggy greedy `{.*}` regex with no validation; now balanced-brace parse + `jsonschema.validate` with retry-on-mismatch (true Workflow parity). Falls back gracefully if `jsonschema` isn't installed.
+- **Budget ceiling** — `CODEX_WF_BUDGET` token cap; `agent()` raises `BudgetExceeded` once exceeded (was a read-only meter).
+
+**Cannot be replicated (Claude Code *harness* features, not exposed by `codex exec`):**
+- **Resume / caching** (`resumeFromRunId`) — the script re-runs every agent; no cached-prefix replay. Biggest remaining gap for iterating on long runs. (Workaround: add your own content-hash disk cache for read-only agents.)
+- **Live background progress** — Workflow returns a runId, runs in background, streams a live tree (`/workflows`). The Python script blocks; closest is `nohup … &` + tailing `log()` output.
+- **MCP access for agents** — Workflow agents reach session MCP tools; this harness runs agents MCP-clean by default (`-c mcp_servers={}`) for speed/determinism. Audit caveat: that flag only *partially* suppresses configured servers (they still attempt to connect) — a deliberate divergence, not full parity.
+
+**Environment constraint (neither tool can change):** your account's cloud policy forces approvals to `OnRequest`, so `-a never` is silently downgraded. Consequence — orchestrated agents can **edit files** (in-sandbox writes need no approval) but **cannot run shell commands** (tests/builds get auto-rejected: *"command execution approval is not supported in exec mode"*). So writer agents are instructed to edit only, and **verification (running tests) must happen in the orchestrator** after collecting diffs — which is the correct division of labor anyway. Note `git add -A` in a worktree also sweeps incidental untracked files (e.g. SCM logs); scope diffs to intended paths when applying.
+
+## Realistic ceilings
+
+- **Per-job CSV hard cap: 64** concurrent workers (`MAX_AGENT_JOB_CONCURRENCY`), and only if `max_threads ≥ 64`.
+- **External harness: no hard cap** — but the real limit is your **API rate limits** (TPM/RPM) and RAM (~8-10 GB per agent that runs a dev server/tests). Lightweight read-only agents scale to dozens; heavy build/test agents top out at 3-5 on a laptop.
+- **Review capacity is the true bottleneck** at scale, not compute. Pin a finite N; never `xargs -P 0`.

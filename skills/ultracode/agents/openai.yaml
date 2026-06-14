@@ -1,0 +1,3 @@
+interface:
+  display_name: "Ultracode"
+  short_description: "Exhaustive multi-agent fan-out with adversarial verification"
