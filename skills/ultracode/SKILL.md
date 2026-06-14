@@ -1,11 +1,11 @@
 ---
 name: ultracode
-description: Explicit-only. Activate ONLY when the user writes the literal token `$ultracode` (or explicitly asks to use the ultracode skill / spawn parallel sub-agents). Do NOT activate on bare "ultra", "ultracode", "ultra-thorough", "audit", "refactor", "dynamic workflow", or similar task wording — those are the task, not activation grammar.
+description: Explicit-only. Activate ONLY when the message contains the literal token `$ultracode`, OR the user explicitly asks to spawn parallel sub-agents / run multi-agent work. Do NOT activate on bare "ultracode" (without the `$`), "ultra", "ultra-thorough", "audit", "refactor", "dynamic workflow", or similar task wording — those are the task, not activation grammar.
 ---
 
 # `$ultracode` — multi-agent orchestration with adversarial verification
 
-Activate only on the explicit `$ultracode` token (or a direct request for parallel sub-agents). When active, strip the `$ultracode` token and treat the rest as the task. The token IS the explicit authorization for sub-agents/delegation/parallel work — the spawn_agent condition is satisfied for this task. Optimize for the most exhaustive, correct result — not the fastest or cheapest.
+Activate on the literal `$ultracode` token, or an explicit request to spawn parallel sub-agents. Match the token literally even if escaped (`\$ultracode`) or punctuation-adjacent; note `$ultracode` expands to empty inside a double-quoted shell `codex exec "$..."`, so if it vanished the user can re-invoke with single quotes. Bare `ultracode` without the `$` does NOT activate. When active, strip the token and treat the rest as the task. The token IS the authorization for sub-agents/delegation — the spawn_agent condition is satisfied for this task. Optimize for the most exhaustive, correct result — not the fastest or cheapest.
 
 ## Phase 0 — routing pre-flight (do this first, in-session, before spawning anything)
 
@@ -18,7 +18,7 @@ Classify the task before deciding how much machinery it needs — this prevents 
 - **adversarial-only** — an existing patch/answer needs falsification; go straight to skeptics.
 - **full** — understand → modify → verify → adversarial gate.
 
-Then pick the executor by scale: **solo** (lightweight), **in-session fan-out** (a handful, up to the concurrency cap), or **external harness** (`codex_workflow.py`, for dozens / deterministic / unattended — see Escalate). State the route, a rough agent-count ceiling, and the executor, then proceed.
+Then pick the executor by scale: **solo** (lightweight), **in-session fan-out** (see the Concurrency and Escalate notes in Mechanics for the exact cap and wave range — don't restate a number here), or the **external harness** (`codex_workflow.py`) for large/deterministic/unattended fan-out. State the route and executor, then proceed.
 
 **Hard environment constraint (read first):** sub-agents may read and edit files, but they **cannot run shell commands** — tests, builds, installers, and repro commands are auto-rejected ("command execution approval is not supported in exec mode"). So *running* code is **only the root's job** (you, the orchestrator). Never ask a worker or skeptic to run anything; have them produce edits and **static** evidence (code read, file:line, grep), and you run the verification after collecting their work. Static evidence is the verification currency here; runtime confirmation is a bonus only the root can supply.
 
@@ -30,7 +30,9 @@ Trivial mechanical edits, single-fact lookups, conversational turns: answer solo
 
 Don't fan out over related work either: failures that may share one root cause (fix one, fix all), exploratory debugging where you don't yet know what's broken, or units needing shared state. Investigate solo until units are provably independent — then fan out.
 
-## The shape of every ultracode run
+## The shape of a full run
+
+This is the `full` route. Other Phase 0 routes are subsets: `lightweight` does steps 1+5 only (no fan-out); `audit` skips edits; `adversarial-only` jumps straight to step 4.
 
 1. **Scout inline first.** Before spawning anything, spend a few tool calls discovering the work-list: which files, which dimensions, which subsystems. You cannot decompose what you haven't scoped.
 2. **Decompose into independent units** — by dimension (bugs / security / perf / API-misuse), by subsystem, or by item (file, endpoint, test). Emit the work-list explicitly with a count, then bind **one agent per unit** — the model under-spawns by default, so never collapse units to save spawns. Units must not need each other's output.
@@ -39,8 +41,6 @@ Don't fan out over related work either: failures that may share one root cause (
    - Homogeneous fan-out over a list → `spawn_agents_on_csv` with an `instruction` template + `output_schema`. Its concurrency is clamped to `min(your max_concurrency, 64, agents.max_threads)` — so throughput is bounded by `max_threads` (16 here), not by `max_concurrency`. When it returns, scan the result CSV's `status`/`last_error` columns: failed or timed-out rows (per-worker `job_max_runtime_seconds`, default 1800s) produced no result — re-run just those or report them uncovered. Never synthesize as if every row succeeded.
 4. **Adversarially verify** anything load-bearing with fresh skeptics (see below).
 5. **Synthesize yourself.** Read every result. You write the final answer — never paste agent output unread. Report what was covered AND what was not (skipped dimensions, capped lists, failed agents, unverified claims). Silent truncation reads as "covered everything" — never do that.
-
-*Example (review a module on 3 dimensions): scout (grep/read to list files) → `spawn_agent` ×3 (bugs / security / perf, each owning the same read-only scope, structured output) back-to-back → `wait_agent` + `close_agent` each as it returns → for each load-bearing finding spawn a `skeptic` to REFUTE → root runs the test suite → synthesize: survived vs refuted vs uncovered.*
 
 ## Writing worker prompts
 
@@ -83,7 +83,7 @@ Workers inherit none of your context. Each prompt must stand alone:
 
 For code changes, add one final gate before reporting, matched to what the change needs:
 - Static/diff-level assurance → spawn a read-only `skeptic` over the complete diff.
-- Runtime correctness → the **root** runs the suite/build (a skeptic cannot), or instruct the **user** to run `/review` (a slash command only the user can invoke; it executes at harness level).
+- Runtime correctness → the **root** runs the suite/build (a skeptic cannot). In an *interactive* session you may also instruct the user to run `/review` (a slash command only the user can invoke); under `codex exec`/CI there is no user, so the root must self-verify or report the gap.
 
 Lead with the verified conclusion. Then: what was swept (dimensions × agents), what survived verification vs was refuted, what failed, and what remains uncovered. Findings that failed adversarial verification are mentioned only as "checked and rejected" — never silently dropped.
 

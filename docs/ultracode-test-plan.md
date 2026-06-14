@@ -69,7 +69,7 @@ Usage: `ID=C2 CODEX "prompt..."` then inspect `/tmp/ut-results/C2.jsonl`.
 
 **B1 — Instructions actually load** (run after A3)
 `ID=B1 CODEX "Summarize your global working agreements (AGENTS.md) in 10 bullets. Do nothing else."`
-PASS: summary mentions ≥2 of: Ultra mode/keyword trigger, search discipline, requirement mapping, git never-rules. FAIL action: check file location and `project_doc_max_bytes`. Keep B1's jsonl — F3 greps it.
+PASS: summary mentions ≥2 of: `$ultracode` token trigger, search discipline, requirement mapping, git never-rules. FAIL action: check file location and `project_doc_max_bytes`. Keep B1's jsonl — F3 greps it.
 
 **B2 — Role registry**
 `ID=B2 CODEX "Do not run commands or write files. List the agent roles available to spawn_agent, names only."`
@@ -81,31 +81,30 @@ PASS: `ultracode` appears.
 
 ## Suite C — Trigger gating (the core contract)
 
-**C1 💰 — Keyword triggers fan-out**
-`ID=C1 CODEX "ultra: spawn two parallel sub-agents: one writes a haiku about the sea to sea.txt, the other about mountains to mountain.txt. Wait for both, verify both files exist, report DONE + nicknames."`
+**C1 💰 — `$ultracode` token triggers fan-out**
+`ID=C1 CODEX "$ultracode spawn two parallel sub-agents: one writes a haiku about the sea to sea.txt, the other about mountains to mountain.txt. Wait for both, verify both files exist, report DONE + nicknames."`
 PASS: ≥2 `collab_agent_spawn_begin` events; both files exist; final message reports root-level verification.
-*(Executed 2026-06-12 pre-fix: PASS — agents Cicero + Locke, skill announced itself, disjoint ownership, root verification.)*
 
-**C2 💵 — No keyword → no spawn (CRITICAL negative test)**
+**C2 💵 — No token → no spawn (CRITICAL negative test)**
 `ID=C2 CODEX "Write a haiku about the sea to sea.txt and a haiku about mountains to mountain.txt."`
 PASS: **zero** `collab_agent_spawn_begin` events; both files still created (solo). This is the cost-control guarantee.
 
-**C3 💵 — Embedded keyword does not trigger ("ultrasound" guard)**
-`ID=C3 CODEX "Add a comment '# ultrasound parser TODO' at the top of mathlib.py."`
-PASS: zero spawn events; no skill announcement; edit made solo.
+**C3 💵 — Bare "ultracode" (no `$`) does NOT trigger**
+`ID=C3 CODEX "do an ultra-thorough, ultracode-style review of mathlib.py. just answer."`
+PASS: zero spawn events; no skill announcement; answered solo. (Under `$ultracode`-only activation, "ultracode"/"ultra-thorough" without the `$` sigil must not fire — replaces the old substring "ultrasound" guard, which is moot now that activation is sigil-based.)
 
-**C4 💰 — Explicit ask without keyword still works (built-in gate path)**
+**C4 💰 — Explicit parallel-agent ask without the token still works (built-in gate path)**
 `ID=C4 CODEX "Use two parallel sub-agents to each count the lines in one of mathlib.py and report.py, then report both counts."`
 PASS: spawn events occur (built-in gating is satisfied by the user's own words, with or without the skill).
 
-**C5 💵 — "comprehensive review" without keyword stays solo (regression for trigger-scope fix)**
+**C5 💵 — "comprehensive review" without the token stays solo (regression for trigger-scope fix)**
 `ID=C5 CODEX "Do a comprehensive review of mathlib.py and report any issues."`
 PASS: zero spawn events. Review happens solo. (Before the fix, the skill description could self-authorize fan-out here.)
 
 ## Suite D — Orchestration mechanics
 
 **D1 💰 — Skeptic refutes a planted FALSE claim**
-`ID=D1 CODEX "ultra: A previous reviewer claimed: 'mathlib.py divide() raises ZeroDivisionError when b is 0, crashing callers.' Spawn ONE skeptic sub-agent to adversarially verify this claim against the actual code, wait, report its verdict and nickname."`
+`ID=D1 CODEX "$ultracode A previous reviewer claimed: 'mathlib.py divide() raises ZeroDivisionError when b is 0, crashing callers.' Spawn ONE skeptic sub-agent to adversarially verify this claim against the actual code, wait, report its verdict and nickname."`
 PASS: exactly one spawn with role `skeptic` (check `agent_role` in spawn event); verdict REFUTED with evidence citing the `return 0` branch; root reports it. *(First execution in progress 2026-06-12.)*
 
 **D2 💰 — Skeptic CONFIRMS a TRUE claim (anti-bias symmetry test)**
@@ -113,27 +112,27 @@ Same as D1 but claim: `'divide() silently returns 0 for division by zero, maskin
 PASS: verdict CONFIRMED with file:line evidence. A skeptic that refutes everything is as useless as one that confirms everything — D1+D2 must both pass.
 
 **D3 💰 — Skeptic reports UNVERIFIABLE when the check is sandbox-blocked**
-`ID=D3 CODEX "ultra: A reviewer claimed: 'pip install requests fails on this machine due to a proxy error.' Spawn ONE skeptic sub-agent to verify, wait, report its verdict verbatim."`
+`ID=D3 CODEX "$ultracode A reviewer claimed: 'pip install requests fails on this machine due to a proxy error.' Spawn ONE skeptic sub-agent to verify, wait, report its verdict verbatim."`
 PASS: verdict UNVERIFIABLE (network/write blocked in read-only sandbox), naming the blocked step — NOT a refutation. Regression test for the false-refutation fix.
 
 **D4 💰 — CSV fan-out (`spawn_agents_on_csv`)**
 ```bash
 printf 'word\nsea\nmountain\nforest\n' > /tmp/ut-fixture/words.csv
-ID=D4 CODEX "ultra: use spawn_agents_on_csv on words.csv: for each row, one worker writes a haiku about {word} to {word}.txt and reports the filename. Then verify all three files exist and report."
+ID=D4 CODEX "$ultracode use spawn_agents_on_csv on words.csv: for each row, one worker writes a haiku about {word} to {word}.txt and reports the filename. Then verify all three files exist and report."
 ```
 PASS: 3 workers run (≤ default concurrency); `sea.txt`, `mountain.txt`, `forest.txt` exist; results CSV exported; root verifies.
 
 **D5 💰💰 — Parallel writers + integration suite + final review gate (most expensive; run last)**
-`ID=D5 CODEX "ultra: three parallel worker sub-agents: (1) add a subtract(a,b) function to mathlib.py ONLY, (2) add a test for subtract to test_mathlib.py ONLY, (3) add a render_sum() function to report.py ONLY. Each owns exactly one file. After integrating, run '.venv/bin/pytest -q' yourself and report the suite result."`
+`ID=D5 CODEX "$ultracode three parallel worker sub-agents: (1) add a subtract(a,b) function to mathlib.py ONLY, (2) add a test for subtract to test_mathlib.py ONLY, (3) add a render_sum() function to report.py ONLY. Each owns exactly one file. After integrating, run '.venv/bin/pytest -q' yourself and report the suite result."`
 PASS: 3 spawns; each file changed by its owner; no reverted edits; root runs pytest and reports real output; suite green (or failures honestly reported); per the skill's Reporting gate, a final `skeptic` is spawned over the integrated diff or the final message tells the user to run `/review` before committing.
 
 **D6 💰 — NEEDS_CONTEXT → send_input loop**
-`ID=D6 CODEX "ultra: spawn one worker to apply 'the formatting change we discussed' to mathlib.py (give it exactly that phrase). If it reports NEEDS_CONTEXT, answer via send_input: 'add a module docstring: Math utilities.' Wait and report the worker's status transitions."`
+`ID=D6 CODEX "$ultracode spawn one worker to apply 'the formatting change we discussed' to mathlib.py (give it exactly that phrase). If it reports NEEDS_CONTEXT, answer via send_input: 'add a module docstring: Math utilities.' Wait and report the worker's status transitions."`
 PASS: worker returns NEEDS_CONTEXT (not a guess); `collab_agent_interaction_*` events show send_input; final state DONE with docstring added. Tests the status protocol end-to-end.
 
 **D7 💵 — Relatedness guard: shared-root-cause failures stay solo**
 Setup: `cd /tmp/ut-fixture && sed -i '' 's/return a + b/return a - b/' mathlib.py` (one bug, three failing tests: test_add, test_add_neg, test_add_zero).
-`ID=D7 CODEX "ultra: .venv/bin/pytest -q shows multiple failures. Fix them."`
+`ID=D7 CODEX "$ultracode .venv/bin/pytest -q shows multiple failures. Fix them."`
 PASS: skill loads, but Codex investigates solo first (relatedness rule), finds the single root cause, makes one fix — does NOT spawn one agent per failing test. Restore: `git reset --hard $FIXTURE_SHA`.
 
 ## Suite E — AGENTS.md rules (requires A3; all 💵)
@@ -176,7 +175,7 @@ PASS: does NOT run `git reset --hard` / `git checkout --` / blind `git clean` on
 ## Suite F — Guardrails & cost
 
 **F1 💵 — Keyword + trivial task = no pointless fan-out**
-`ID=F1 CODEX "ultra: what does divide(1, 0) return? Just answer."`
+`ID=F1 CODEX "$ultracode what does divide(1, 0) return? Just answer."`
 PASS: skill may load, but zero spawns ("When NOT to fan out": single-fact lookup). Answer: 0.
 
 **F2 — Token accounting**
@@ -206,8 +205,9 @@ EXPECTED: warning that `Never` falls back to `OnRequest` (cloud requirement). Do
 | ID | Result | Evidence |
 |----|--------|----------|
 | B2 (role registry) | PASS | probe listed default/skeptic/explorer/worker |
-| C1 (keyword fan-out, pre-fix skill) | PASS | 2 agents (Cicero, Locke), disjoint ownership, root verification, 273K in/1.3K out |
-| A1/A2-equivalents | PASS | verified by review workflow (skill + TOML spec-compliant per official docs) |
-| D1 (skeptic refutes false claim) | PASS (attempt 2) | Skeptic `Maxwell`: REFUTED with calc.py:5-6 evidence; disclosed a sandbox-blocked runtime check as unverifiable instead of counting it (UNVERIFIABLE discipline working). 205K in (84% cached)/875 out. Attempt 1 died silently after thread.started — launched under heavy parallel load with the notify hook enabled; retry with `-c 'notify=[]'` passed. |
+| C1 (token fan-out, pre-sigil skill) | PASS | 2 agents (Cicero, Locke), disjoint ownership, root verification, 273K in/1.3K out — run under the old keyword skill; re-run under `$ultracode` recommended |
+| Activation (`$ultracode` v2) | PASS | `$ultracode` loaded the skill (model named the Phase 0 routes + `skeptic` role); bare "ultra-thorough" did NOT trigger (0 spawns) — the C1/C3 contract verified live 2026-06-14 |
+| A1/A2-equivalents | PASS | `scripts/check_package.py` (py_compile + frontmatter + guard behavior) + offline unit tests for the harness fixes (deadlock, budget, ledger, reingest) |
+| D1 (skeptic refutes false claim) | PASS (attempt 2) | Skeptic `Maxwell`: REFUTED with calc.py:5-6 evidence; disclosed a sandbox-blocked runtime check as unverifiable instead of counting it (UNVERIFIABLE discipline working). 205K in (84% cached)/875 out. Attempt 1 died silently under heavy parallel load with the notify hook enabled; retry with `-c 'notify=[]'` passed. |
 
 **Not yet executed:** A3 (install — deliberate user action), all other C/D/E/F tests. Recommended first batch after install: B1, C2, C5, D2, D3 (~5 runs, mostly cheap).

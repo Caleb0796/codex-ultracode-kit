@@ -4,8 +4,8 @@ Codex CLI 0.125 (your build) ships native multi-agent support: `multi_agent` is 
 
 ## Installed and verified (2026-06-12)
 
-**1. `~/.codex/skills/ultracode/SKILL.md`** — the orchestration playbook. Triggers on "ultra"/"ultracode" in your message (your saying the keyword *is* the explicit ask the gate requires). Encodes: scout → decompose → fan out (`spawn_agent` / `spawn_agents_on_csv`) → adversarial verify → synthesize; plus the quality patterns (independent skeptics that refute findings, loop-until-dry discovery, multi-angle sweeps, judge panels, completeness critic), disjoint file ownership for parallel writers, and honest coverage reporting.
-*Verified live:* `codex exec "ultra: spawn two parallel sub-agents…"` → the skill auto-triggered, two sub-agents (Cicero, Locke) ran in parallel with disjoint ownership, and the root did its own verification rather than trusting worker reports.
+**1. `~/.codex/skills/ultracode/SKILL.md`** — the orchestration playbook. Triggers on the literal `$ultracode` token in your message (the token *is* the explicit ask the gate requires). Encodes: scout → decompose → fan out (`spawn_agent` / `spawn_agents_on_csv`) → adversarial verify → synthesize; plus the quality patterns (independent skeptics that refute findings, loop-until-dry discovery, multi-angle sweeps, judge panels, completeness critic), disjoint file ownership for parallel writers, and honest coverage reporting.
+*Verified live:* `codex exec "$ultracode spawn two parallel sub-agents…"` → the skill auto-triggered, two sub-agents (Cicero, Locke) ran in parallel with disjoint ownership, and the root did its own verification rather than trusting worker reports.
 
 **2. `~/.codex/agents/skeptic.toml`** — a custom adversarial-verifier role, `sandbox_mode = "read-only"`, instructed to refute rather than confirm.
 *Verified live:* role probe returned `default, skeptic, explorer, worker` — the custom role loads. Built-ins: `explorer` (read-heavy), `worker` (read-write).
@@ -17,9 +17,9 @@ cp ~/Desktop/agent_md/AGENTS.md ~/.codex/AGENTS.md
 
 ## How to use
 
-- `ultra: <task>` in any Codex session (interactive or `codex exec`) → full orchestration: parallel sub-agents, adversarial verification, synthesis.
+- `$ultracode <task>` in any Codex session (interactive or `codex exec`) → full orchestration: parallel sub-agents, adversarial verification, synthesis.
 - Plain messages → normal solo Codex. No keyword, no token multiplier (sub-agent runs cost roughly N× tokens; the smoke test burned ~273K input tokens for a toy task, 76% cached).
-- For homogeneous fan-out ("do X for each of these 200 files"), say `ultra` and mention the list — the skill steers Codex to `spawn_agents_on_csv`.
+- For homogeneous fan-out ("do X for each of these 200 files"), use `$ultracode` and mention the list — the skill steers Codex to `spawn_agents_on_csv`.
 
 ## Worth adding next (config snippets — your call, not auto-applied)
 

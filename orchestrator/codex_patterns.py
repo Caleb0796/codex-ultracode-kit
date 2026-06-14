@@ -67,8 +67,9 @@ def judge_panel(task, approaches, schema=None):
         + "\n\n".join(f"[{i}] ({a['approach']}): {a['answer']}" for i, a in enumerate(attempts)),
         schema={"type": "object", "properties": {"best_index": {"type": "integer"},
                                                   "why": {"type": "string"}}}, role="judge")
-    return {"winner": attempts[judged["best_index"]] if attempts else None,
-            "why": judged.get("why"), "attempts": attempts}
+    idx = judged.get("best_index", 0) if judged else 0
+    winner = attempts[idx] if attempts and 0 <= idx < len(attempts) else (attempts[0] if attempts else None)
+    return {"winner": winner, "why": (judged or {}).get("why"), "attempts": attempts}
 
 
 def loop_until_dry(finder, key, max_dry=2, max_rounds=10):
@@ -159,6 +160,12 @@ def reingest_findings(results_dir):
             if str(r.get("status", "")).lower() in ("fail", "failed", "blocked"):
                 blocking.append({"file": os.path.basename(path), "severity": "high",
                                  "claim": f"worker status={r.get('status')}: {str(r.get('summary', ''))[:160]}"})
+            # completeness_critic output: anything not all-verified blocks the gate
+            if r.get("all_verified") is False:
+                unmet = [q.get("requirement", "?") for q in (r.get("requirements") or [])
+                         if isinstance(q, dict) and q.get("status") != "verified"]
+                blocking.append({"file": os.path.basename(path), "severity": "high",
+                                 "claim": f"not all requirements verified: {', '.join(unmet)[:160]}"})
             for f in (r.get("findings") or []):
                 if isinstance(f, dict) and str(f.get("severity", "")).lower() in ("critical", "high"):
                     blocking.append({"file": os.path.basename(path), "severity": f.get("severity"),
@@ -166,10 +173,14 @@ def reingest_findings(results_dir):
     return {"blocking": blocking, "files": n, "gate": "fail" if blocking else "pass"}
 
 
-def review_then_verify(dimensions, find_schema, target="the code in this directory"):
+def review_then_verify(dimensions, find_schema, target="the code in this directory", run_dir=None):
     """Canonical ultracode review: one reviewer per dimension, each finding then
     adversarially verified with STATIC lenses (pipeline = no barrier, each verifies
-    as soon as its review lands)."""
+    as soon as its review lands).
+
+    If `run_dir` is given (from wf.start_run), every confirmed finding is persisted via
+    wf.save_result and a ledger is written via wf.write_ledger — so the audit trail is
+    actually produced, not just available as an API."""
     def review(dim, _o, _i):
         return wf.agent(f"Review {target} for {dim}. Return your findings.",
                         schema=find_schema, role=f"{dim} reviewer")
@@ -182,4 +193,13 @@ def review_then_verify(dimensions, find_schema, target="the code in this directo
             for f in items])
 
     out = wf.pipeline(dimensions, review, verify)
-    return [f for sub in out if sub for f in sub if f and f["verdict"]["survives"]]
+    confirmed = [f for sub in out if sub for f in sub if f and f["verdict"]["survives"]]
+    if run_dir:
+        for i, f in enumerate(confirmed):
+            wf.save_result(run_dir, f"finding_{i}", f)
+        wf.write_ledger(run_dir, {
+            "Scope": f"{target}; dimensions: {', '.join(map(str, dimensions))}",
+            "Findings": "\n".join(f"- [{f.get('dim')}] {str(f)[:200]}" for f in confirmed) or "none survived verification",
+            "Adversarial gate": f"{len(confirmed)} confirmed (static lenses: correctness/security/contract)",
+        })
+    return confirmed

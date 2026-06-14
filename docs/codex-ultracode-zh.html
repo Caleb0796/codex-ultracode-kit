@@ -150,13 +150,14 @@
 <!-- 3 -->
 <section id="trigger">
   <h2><span class="num">03</span>触发方式与门控</h2>
-  <p class="lead">Codex 的「明确要求才生成」是一道硬门控；关键词就是用来满足它的。</p>
+  <p class="lead">Codex 的「明确要求才生成」是一道硬门控；显式 <code>$ultracode</code> token 就是用来满足它的。</p>
   <div class="kv">
-    <dt>触发词</dt><dd>消息中出现独立单词 <code>ultra</code>（非 <code>ultrasound</code> 之类的子串）或 <code>ultracode</code> → 视为「明确要求并行子智能体」，技能启动。</dd>
-    <dt>自然语言</dt><dd>不用关键词、直接说「用并行子智能体…」「派一个 skeptic 去验证…」同样满足原生门控。</dd>
-    <dt>默认行为</dt><dd>两者都没有 → 单智能体独立完成（成本控制保证：无关键词不扇出）。</dd>
+    <dt>触发词</dt><dd>消息中出现字面 token <code>$ultracode</code>（即使被转义 <code>\$ultracode</code> 或紧贴标点也按字面匹配）→ 视为「明确要求并行子智能体」，技能启动。</dd>
+    <dt>自然语言</dt><dd>不用 token、直接说「用并行子智能体…」「派一个 skeptic 去验证…」同样满足原生门控。</dd>
+    <dt>不触发</dt><dd>不带 <code>$</code> 的 <code>ultracode</code>、<code>ultra-thorough</code>、<code>audit</code>、<code>refactor</code> 等任务措辞 → 不启动（避免误触发）。</dd>
+    <dt>默认行为</dt><dd>两者都没有 → 单智能体独立完成（成本控制保证：无 token 不扇出）。</dd>
   </div>
-  <div class="note warn"><b>已修正的坑：</b>技能描述最初会在「做个全面 review」这类<b>无关键词</b>请求上自我授权扇出，与原生门控冲突。已收紧为仅在关键词或明确的多智能体请求时触发。</div>
+  <div class="note warn"><b>已修正的坑：</b>旧版用裸关键词 <code>ultra</code>/<code>ultracode</code> 触发，会在「做个 ultra 彻底的 review」这类措辞上误触发。v2 改为仅 <code>$ultracode</code> 显式 token 触发。</div>
 </section>
 
 <!-- 4 -->

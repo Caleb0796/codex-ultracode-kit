@@ -19,14 +19,20 @@ Env knobs:
   CODEX_WF_EFFORT       reasoning effort (default medium)
   CODEX_WF_CWD          base working dir / git repo agents run in (default $PWD)
   CODEX_WF_TIMEOUT      per-agent timeout seconds (default 1800)
+  CODEX_WF_BUDGET       soft token ceiling; stops launching new agents once exceeded (0 = off)
+  CODEX_WF_CACHE        "1" or a dir: content-hash cache so identical agent calls replay (resume)
+  CODEX_WF_RUNS         run-ledger root (default $CWD/.codex/ultracode/runs)
 """
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 MODEL = os.environ.get("CODEX_WF_MODEL", "gpt-5.5")
@@ -34,12 +40,24 @@ EFFORT = os.environ.get("CODEX_WF_EFFORT", "medium")
 CONCURRENCY = int(os.environ.get("CODEX_WF_CONCURRENCY", "8"))
 CWD = os.environ.get("CODEX_WF_CWD", os.getcwd())
 TIMEOUT = int(os.environ.get("CODEX_WF_TIMEOUT", "1800"))
-BUDGET = int(os.environ.get("CODEX_WF_BUDGET", "0"))  # token ceiling; 0 = unlimited
+RUNS_ROOT = os.environ.get("CODEX_WF_RUNS", os.path.join(CWD, ".codex", "ultracode", "runs"))
 
-_pool = ThreadPoolExecutor(max_workers=CONCURRENCY)
+# Global cap on CONCURRENT codex exec processes. We do NOT use a single shared
+# ThreadPoolExecutor: parallel() is called recursively (a pipeline stage calls
+# parallel(), which calls adversarial_verify(), which calls parallel()), and a
+# shared pool deadlocks when outer tasks hold every worker while waiting on inner
+# tasks that can never get a slot. Instead parallel() spawns an ephemeral pool per
+# call, and this semaphore (acquired around the actual subprocess) bounds real
+# process concurrency regardless of nesting depth.
+_sem = threading.Semaphore(CONCURRENCY)
 _tok_lock = threading.Lock()
 _tokens = [0]
 _worktrees = []
+
+
+def _budget():
+    """Read the token ceiling live (env can change between runs). 0 = unlimited."""
+    return int(os.environ.get("CODEX_WF_BUDGET", "0"))
 
 try:
     import jsonschema as _jsonschema
@@ -102,9 +120,33 @@ def _extract_json(text):
     return text[start:]
 
 
+def _cache_key(parts):
+    return hashlib.sha256("\x00".join(str(p) for p in parts).encode()).hexdigest()
+
+
 def _run_once(prompt, schema, cwd, sandbox, model, effort):
-    if BUDGET and tokens_used() >= BUDGET:
-        raise BudgetExceeded(f"token budget {BUDGET} reached ({tokens_used()} used)")
+    # Soft budget: reserve-before-spend. The true cost is only known after the run,
+    # so this is a soft cap — it stops LAUNCHING new agents once exceeded, it can't
+    # claw back in-flight spend. Checked under the lock just before each launch.
+    b = _budget()
+    if b:
+        with _tok_lock:
+            if _tokens[0] >= b:
+                raise BudgetExceeded(f"token budget {b} reached ({_tokens[0]} used)")
+    # Optional content-hash cache (resume): identical (prompt, schema, model, effort,
+    # sandbox) returns the prior result instead of re-spawning. Opt-in via CODEX_WF_CACHE=1.
+    cache_dir = os.environ.get("CODEX_WF_CACHE")
+    ckey = None
+    if cache_dir:
+        cdir = cache_dir if cache_dir not in ("1", "true", "on") else os.path.join(RUNS_ROOT, "..", "cache")
+        os.makedirs(cdir, exist_ok=True)
+        ckey = os.path.join(cdir, _cache_key([prompt, json.dumps(schema, sort_keys=True), model or MODEL,
+                                              effort or EFFORT, sandbox]) + ".json")
+        if os.path.exists(ckey):
+            with open(ckey) as f:
+                hit = json.load(f)
+            log("cache hit")
+            return hit["value"]
     with tempfile.TemporaryDirectory() as td:
         out = os.path.join(td, "out.txt")
         logf = os.path.join(td, "log.txt")
@@ -129,27 +171,35 @@ def _run_once(prompt, schema, cwd, sandbox, model, effort):
         cmd.append(prompt)
         # Child output -> FILE, never PIPE: codex emits enough text that pipe buffers (~64KB)
         # fill under concurrency and subprocess.run deadlocks. The result comes from -o anyway.
-        with open(logf, "w") as lf:
+        # _sem bounds the number of concurrent codex processes across all nesting levels.
+        with open(logf, "w") as lf, _sem:
             subprocess.run(cmd, check=True, stdout=lf, stderr=lf, timeout=TIMEOUT)
-        # rough token accounting from the codex console footer ("tokens used  N")
+        # rough token accounting from the codex footer (handles "tokens used N" and "total=N")
         try:
-            toks = re.findall(r"tokens used[\s:]*([\d,]+)", open(logf).read())
+            with open(logf) as f:
+                blob = f.read()
+            toks = re.findall(r"(?:tokens used|total)[\s=:]*([\d,]+)", blob, re.I)
             if toks:
                 with _tok_lock:
-                    _tokens[0] += int(toks[-1].replace(",", ""))
+                    _tokens[0] += max(int(t.replace(",", "")) for t in toks)
         except Exception:
             pass
-        text = open(out).read().strip()
+        with open(out) as f:
+            text = f.read().strip()
         if schema is None:
-            return text
-        # --output-schema yields pure JSON; parse directly, fall back to balanced extraction.
-        try:
-            obj = json.loads(text)
-        except json.JSONDecodeError:
-            obj = json.loads(_extract_json(text))
-        if _jsonschema is not None:
-            _jsonschema.validate(obj, schema)  # raises -> caller's retry loop re-runs
-        return obj
+            result = text
+        else:
+            # --output-schema yields pure JSON; parse directly, fall back to balanced extraction.
+            try:
+                result = json.loads(text)
+            except json.JSONDecodeError:
+                result = json.loads(_extract_json(text))
+            if _jsonschema is not None:
+                _jsonschema.validate(result, schema)  # raises -> caller's retry loop re-runs
+        if ckey:
+            with open(ckey, "w") as f:
+                json.dump({"value": result}, f)
+        return result
 
 
 def agent(prompt, schema=None, cwd=None, sandbox="read-only",
@@ -186,8 +236,12 @@ def _agent_worktree(prompt, schema, model, effort, base=None):
     base = base or CWD
     wt = tempfile.mkdtemp(prefix="cxwt-")
     branch = "cxwf/" + os.path.basename(wt)
-    subprocess.run(["git", "-C", base, "worktree", "add", "-q", "-b", branch, wt, "HEAD"],
-                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    add = subprocess.run(["git", "-C", base, "worktree", "add", "-q", "-b", branch, wt, "HEAD"],
+                         capture_output=True, text=True)
+    if add.returncode != 0:
+        shutil.rmtree(wt, ignore_errors=True)  # don't leak the empty tempdir
+        raise RuntimeError(f"git worktree add failed (is {base} a git repo with a HEAD?): "
+                           f"{add.stderr.strip()[:200]}")
     try:
         result = _run_once(_WRITER_RULE + prompt, schema, wt, "workspace-write", model, effort)
         subprocess.run(["git", "-C", wt, "add", "-A"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -215,16 +269,22 @@ def cleanup_worktrees():
 
 
 def parallel(thunks):
-    """Run thunks (0-arg callables) concurrently, capped at CONCURRENCY.
-    Promise.allSettled semantics: a thunk that raises yields None, never aborts the batch."""
-    futs = [_pool.submit(t) for t in thunks]
+    """Run thunks (0-arg callables) concurrently. Promise.allSettled semantics: a thunk
+    that raises yields None, never aborts the batch. Uses an EPHEMERAL pool per call so
+    nested parallel() (a pipeline stage calling parallel(), which calls adversarial_verify(),
+    which calls parallel()) can't deadlock on a shared pool's exhausted slots; real process
+    concurrency is bounded by the module-global _sem around each subprocess instead."""
+    thunks = list(thunks)
+    if not thunks:
+        return []
     results = []
-    for f in futs:
-        try:
-            results.append(f.result())
-        except Exception as e:
-            results.append(None)
-            log(f"agent failed: {e}")
+    with ThreadPoolExecutor(max_workers=max(1, min(CONCURRENCY * 2, len(thunks)))) as pool:
+        for f in [pool.submit(t) for t in thunks]:
+            try:
+                results.append(f.result())
+            except Exception as e:
+                results.append(None)
+                log(f"agent failed: {e}")
     return results
 
 
@@ -246,17 +306,17 @@ def pipeline(items, *stages):
 
 # --- Durable run ledger: a human-auditable trail on disk -----------------------------
 # A real process orchestrator should leave the same audit trail an artifact-scaffolding
-# tool does. start_run() makes runs/<ts-sha>/; write_ledger() rewrites ledger.md
+# tool does. start_run() makes runs/<ts-sha-pid-rand>/; write_ledger() rewrites ledger.md
 # idempotently; save_result() drops a worker result for reingest_findings() to gate on.
-import hashlib
-import time
-
-RUNS_ROOT = os.environ.get("CODEX_WF_RUNS", os.path.join(CWD, ".codex", "ultracode", "runs"))
+# review_then_verify() wires all three together when passed run_dir=.
 
 
 def start_run(task, mode="auto"):
-    """Create runs/<timestamp>-<sha1(task)[:8]>/ with run.json + results/. Returns the dir."""
-    rid = time.strftime("%Y%m%d-%H%M%S") + "-" + hashlib.sha1(task.encode()).hexdigest()[:8]
+    """Create runs/<timestamp>-<sha1(task)[:8]>-<pid>-<rand>/ with run.json + results/.
+    The pid+random suffix prevents collisions between concurrent same-second runs of the
+    same task (sha1(task) alone is NOT unique). Returns the dir."""
+    rid = "-".join([time.strftime("%Y%m%d-%H%M%S"), hashlib.sha1(task.encode()).hexdigest()[:8],
+                    str(os.getpid()), os.urandom(2).hex()])
     d = os.path.join(RUNS_ROOT, rid)
     os.makedirs(os.path.join(d, "results"), exist_ok=True)
     with open(os.path.join(d, "run.json"), "w") as f:
@@ -267,8 +327,10 @@ def start_run(task, mode="auto"):
 
 
 def save_result(run_dir, item_id, result):
-    """Persist one worker/skeptic result as results/<item_id>.json (for reingest_findings)."""
-    p = os.path.join(run_dir, "results", f"{item_id}.json")
+    """Persist one worker/skeptic result as results/<item_id>.json (for reingest_findings).
+    item_id is sanitized so a slash/`..` can't escape the results/ dir."""
+    safe = re.sub(r"[^\w.-]", "_", str(item_id)).strip(".") or "item"
+    p = os.path.join(run_dir, "results", f"{safe}.json")
     with open(p, "w") as f:
         json.dump(result, f, indent=2)
     return p

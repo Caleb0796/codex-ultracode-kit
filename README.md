@@ -55,17 +55,15 @@ For genuinely large, deterministic fan-out, drive the external harness instead:
 import codex_workflow as wf
 import codex_patterns as cp
 
-# 8 reviewers in parallel, each finding adversarially verified
-results = wf.pipeline(
-    ["correctness", "security", "perf"],
-    lambda dim, *_: wf.agent(f"Review this directory for {dim}.", schema=FINDINGS),
-    lambda rev, dim, _: wf.parallel([
-        (lambda f=f: cp.adversarial_verify(str(f), lenses=("correctness","security")))
-        for f in (rev or {}).get("findings", [])]),
-)
+# one reviewer per dimension, each finding adversarially verified by independent skeptics;
+# pass run_dir to leave a durable audit trail (run.json + results/ + ledger.md on disk).
+run = wf.start_run("review module on 3 dimensions")
+confirmed = cp.review_then_verify(["correctness", "security", "perf"], FINDINGS, run_dir=run)
+# confirmed = findings that survived 3-lens (correctness/security/contract) refutation.
+# The ledger at run/ledger.md records Scope / Findings / Adversarial gate.
 ```
 
-`CODEX_WF_CONCURRENCY`, `CODEX_WF_MODEL`, `CODEX_WF_EFFORT`, `CODEX_WF_BUDGET`, `CODEX_WF_CWD` tune the harness.
+`CODEX_WF_CONCURRENCY`, `CODEX_WF_MODEL`, `CODEX_WF_EFFORT`, `CODEX_WF_TIMEOUT`, `CODEX_WF_BUDGET` (soft token cap), `CODEX_WF_CACHE` (=1 to replay identical calls), `CODEX_WF_RUNS`, `CODEX_WF_CWD` tune the harness.
 
 ## Three layers, by scale
 
