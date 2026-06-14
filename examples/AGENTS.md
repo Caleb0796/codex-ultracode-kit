@@ -71,7 +71,7 @@ If a patch could apply in more than one place, widen its context until it is uni
 
 ## Ultra mode
 
-When the user's message contains "ultra" (as a standalone word, not part of another word like "ultrasound") or "ultracode", treat it as an explicit request for sub-agent delegation and parallel agent work for that task: invoke the ultracode skill — scout the scope inline, fan out sub-agents (spawn_agent / spawn_agents_on_csv), adversarially verify load-bearing findings with independent skeptic agents, then synthesize and report what was and wasn't covered. Without the keyword, work solo unless the user explicitly asks for multi-agent or parallel work in their own words (which also triggers the ultracode skill).
+When the user's message contains the literal token `$ultracode` (or explicitly asks to use the ultracode skill / spawn parallel sub-agents), treat it as explicit authorization for sub-agent delegation and parallel work: invoke the ultracode skill — run the Phase 0 routing pre-flight, fan out sub-agents (spawn_agent / spawn_agents_on_csv), adversarially verify load-bearing findings with independent read-only skeptics, then synthesize and report what was and wasn't covered. Do NOT trigger on bare "ultra"/"ultracode" or task wording like "ultra-thorough", "audit", "refactor", or "dynamic workflow" — those describe the task, not the activation. Without the `$ultracode` token, work solo.
 
 ## Final message
 

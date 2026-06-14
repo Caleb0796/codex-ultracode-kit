@@ -4,8 +4,16 @@
 The Workflow tool is just an engine; "ultracode" is the set of quality patterns
 you run on it (adversarial verification, judge panels, loop-until-dry, completeness
 critic). These are the same patterns Claude Code's ultracode uses, ported to Codex.
+
+Verification discipline here is environment-correct for Codex: skeptics are
+read-only and use STATIC lenses (they cannot run shell under a cloud OnRequest
+policy — a sandbox-blocked check is UNVERIFIABLE, never a refutation). Anything
+that needs running code is the root's job; `verification_shallow` guards against
+calling a parse/compile check "proof".
 """
+import glob
 import json
+import os
 
 import codex_workflow as wf
 
@@ -14,16 +22,31 @@ _VERDICT = {
     "properties": {"real": {"type": "boolean"}, "why": {"type": "string"}},
 }
 
+# Static lenses only — each is something a read-only skeptic can actually check.
+# "reproduce"/"does-it-run" is deliberately absent: sub-agents can't run commands
+# under OnRequest, so runtime confirmation is the root's job, not a lens.
+LENSES = {
+    "correctness": "logic errors, wrong conditions, off-by-one, missed cases, contradicted invariants",
+    "security": "injection, unsafe deserialization, secrets, path traversal, missing authz",
+    "caller-impact": "callers/imports of every changed symbol — are they all updated or broken?",
+    "contract": "exact filenames, CLI flags, install/build commands, public API signatures, and docs "
+                "match reality (the small-detail failure class: wrong flag, stale README, renamed file)",
+}
 
-def adversarial_verify(claim, lenses=("correctness",), threshold=None):
-    """Spawn one skeptic per lens, each trying to REFUTE the claim. The claim
-    survives only if a majority vote it real. Independence is the point — a finder
-    grading its own work is theater. Returns {'survives','votes'}."""
+
+def adversarial_verify(claim, lenses=("correctness",), threshold=None, evidence=""):
+    """Spawn one read-only `skeptic` per lens, each trying to REFUTE the claim. The
+    claim survives only if a majority vote it real. Independence is the point — a
+    finder grading its own work is theater. Paste the claim + its evidence INTO the
+    prompt (don't make the skeptic hunt for it). Returns {'survives','votes'}."""
     threshold = threshold or (len(lenses) // 2 + 1)
     votes = wf.parallel([
         (lambda lens=lens: wf.agent(
-            f"Adversarially verify this claim through the {lens} lens. Try to REFUTE it; "
-            f"default to real=false if the evidence does not clearly hold.\n\nClaim: {claim}",
+            f"Adversarially verify this claim through the {lens} lens "
+            f"({LENSES.get(lens, lens)}). Try to REFUTE it; default to real=false if the "
+            f"evidence does not clearly hold. If confirming would require running code you "
+            f"cannot run, say so in `why` and return real=false (UNVERIFIABLE is not a pass)."
+            f"\n\nClaim: {claim}\n\nEvidence:\n{evidence or '(none supplied — reason from the repo)'}",
             schema=_VERDICT, role="skeptic"))
         for lens in lenses
     ])
@@ -66,19 +89,87 @@ def loop_until_dry(finder, key, max_dry=2, max_rounds=10):
 
 
 def completeness_critic(original_request, work_summary):
-    """A final pass that maps each explicit requirement to whether it was satisfied —
-    a retrieval fix for the 'lost in the middle' problem, not a self-grade. Returns the gaps."""
+    """Map each explicit requirement to a 5-state status — a retrieval fix for the
+    'lost in the middle' problem, not a self-grade. States must not be collapsed:
+      verified  — proven by executed evidence
+      detected  — a check exists but was not run
+      inferred  — believed from reading, not proven
+      needs-confirmation — conflicting/uncertain
+      unresolved — not addressed
+    Anything not `verified` is not done."""
     return wf.agent(
-        "Re-read this original request and the work done. List each explicit requirement and "
-        "whether the work satisfies it. Anything unsatisfied is NOT DONE.\n\n"
+        "Re-read the original request and the work done. For EACH explicit requirement, give "
+        "one status: verified | detected | inferred | needs-confirmation | unresolved. Do not "
+        "collapse statuses (a parse check that ran is 'detected', not 'verified'). List every "
+        "requirement that is not `verified`.\n\n"
         f"REQUEST:\n{original_request}\n\nWORK:\n{work_summary}",
-        schema={"type": "object", "properties": {"gaps": {"type": "array", "items": {"type": "string"}},
-                                                  "complete": {"type": "boolean"}}}, role="completeness critic")
+        schema={"type": "object", "properties": {
+            "requirements": {"type": "array", "items": {"type": "object", "properties": {
+                "requirement": {"type": "string"},
+                "status": {"type": "string",
+                           "enum": ["verified", "detected", "inferred", "needs-confirmation", "unresolved"]},
+                "evidence": {"type": "string"}}}},
+            "all_verified": {"type": "boolean"}}},
+        role="completeness critic")
+
+
+# --- Deterministic anti-theater guards (no model call; safe to run anywhere) -------
+
+_SHALLOW = ("py_compile", "--noemit", "--no-emit", "tsc --noemit", "compileall",
+            "ast.parse", "syntax", "lint", "ruff", "flake8", "import ")
+
+
+def verification_shallow(commands):
+    """Given the command(s) that 'verified' a change, return a warning if the only
+    thing that ran was a parse/compile/lint check — which proves files parse, NOT
+    that behavior is correct. `commands` is a string or list of strings.
+    Returns "" when at least one real behavioral check (a test runner) ran."""
+    cmds = [commands] if isinstance(commands, str) else list(commands or [])
+    blob = " \n ".join(cmds).lower()
+    if not blob.strip():
+        return "no verification ran — behavior is unproven"
+    ran_tests = any(t in blob for t in ("pytest", "unittest", "go test", "cargo test",
+                                        "jest", "vitest", "npm test", "npm run test", "mocha", "rspec"))
+    if ran_tests:
+        return ""
+    if any(s in blob for s in _SHALLOW):
+        return ("verification was shallow — only parse/compile/lint ran; this proves files "
+                "parse, not that behavior is correct. Run the test suite before claiming success.")
+    return ""
+
+
+def reingest_findings(results_dir):
+    """Read EVERY *.json worker/skeptic result under results_dir (not just files whose
+    name matches 'adversarial' — that filename filter is a real gap in lookalike tools)
+    and surface blocking findings. A result that only exists (empty/no findings) does
+    NOT pass the gate. Returns {'blocking': [...], 'files': n, 'gate': 'pass'|'fail'}."""
+    blocking, n = [], 0
+    for path in sorted(glob.glob(os.path.join(results_dir, "*.json"))):
+        n += 1
+        try:
+            data = json.load(open(path))
+        except Exception:
+            blocking.append({"file": os.path.basename(path), "severity": "high",
+                             "claim": "result file is not valid JSON"})
+            continue
+        recs = data if isinstance(data, list) else [data]
+        for r in recs:
+            if not isinstance(r, dict):
+                continue
+            if str(r.get("status", "")).lower() in ("fail", "failed", "blocked"):
+                blocking.append({"file": os.path.basename(path), "severity": "high",
+                                 "claim": f"worker status={r.get('status')}: {str(r.get('summary', ''))[:160]}"})
+            for f in (r.get("findings") or []):
+                if isinstance(f, dict) and str(f.get("severity", "")).lower() in ("critical", "high"):
+                    blocking.append({"file": os.path.basename(path), "severity": f.get("severity"),
+                                     "claim": str(f.get("claim", ""))[:160]})
+    return {"blocking": blocking, "files": n, "gate": "fail" if blocking else "pass"}
 
 
 def review_then_verify(dimensions, find_schema, target="the code in this directory"):
     """Canonical ultracode review: one reviewer per dimension, each finding then
-    adversarially verified (pipeline = no barrier, each verifies as soon as its review lands)."""
+    adversarially verified with STATIC lenses (pipeline = no barrier, each verifies
+    as soon as its review lands)."""
     def review(dim, _o, _i):
         return wf.agent(f"Review {target} for {dim}. Return your findings.",
                         schema=find_schema, role=f"{dim} reviewer")
@@ -87,7 +178,7 @@ def review_then_verify(dimensions, find_schema, target="the code in this directo
         items = (rev or {}).get("findings", [])
         return wf.parallel([
             (lambda f=f: {**f, "dim": dim, "verdict": adversarial_verify(
-                json.dumps(f), lenses=("correctness", "security", "reproduce"))})
+                json.dumps(f), lenses=("correctness", "security", "contract"))})
             for f in items])
 
     out = wf.pipeline(dimensions, review, verify)

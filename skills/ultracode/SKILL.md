@@ -1,11 +1,24 @@
 ---
 name: ultracode
-description: Use when the user's message contains "ultra" (as a standalone word) or "ultracode", or when they explicitly ask for parallel sub-agents, agent delegation, or multi-agent fan-out/verification.
+description: Explicit-only. Activate ONLY when the user writes the literal token `$ultracode` (or explicitly asks to use the ultracode skill / spawn parallel sub-agents). Do NOT activate on bare "ultra", "ultracode", "ultra-thorough", "audit", "refactor", "dynamic workflow", or similar task wording — those are the task, not activation grammar.
 ---
 
-# Ultracode — multi-agent orchestration with adversarial verification
+# `$ultracode` — multi-agent orchestration with adversarial verification
 
-The user invoking this skill (or saying "ultra"/"ultracode") IS an explicit request for sub-agents, delegation, and parallel agent work. The spawn_agent authorization condition is satisfied for this entire task. Optimize for the most exhaustive, correct result — not the fastest or cheapest.
+Activate only on the explicit `$ultracode` token (or a direct request for parallel sub-agents). When active, strip the `$ultracode` token and treat the rest as the task. The token IS the explicit authorization for sub-agents/delegation/parallel work — the spawn_agent condition is satisfied for this task. Optimize for the most exhaustive, correct result — not the fastest or cheapest.
+
+## Phase 0 — routing pre-flight (do this first, in-session, before spawning anything)
+
+Classify the task before deciding how much machinery it needs — this prevents both over-spawning trivial work and under-spawning real work. Pick one route and state it:
+
+- **lightweight** — small/local; one direct pass + a quick verify. No fan-out.
+- **audit** — read-only mapping/review; explorer + skeptic agents, no edits.
+- **implementation** — understand → edit → verify.
+- **refactor / migration** — map first, then batched workers over many sites.
+- **adversarial-only** — an existing patch/answer needs falsification; go straight to skeptics.
+- **full** — understand → modify → verify → adversarial gate.
+
+Then pick the executor by scale: **solo** (lightweight), **in-session fan-out** (a handful, up to the concurrency cap), or **external harness** (`codex_workflow.py`, for dozens / deterministic / unattended — see Escalate). State the route, a rough agent-count ceiling, and the executor, then proceed.
 
 **Hard environment constraint (read first):** sub-agents may read and edit files, but they **cannot run shell commands** — tests, builds, installers, and repro commands are auto-rejected ("command execution approval is not supported in exec mode"). So *running* code is **only the root's job** (you, the orchestrator). Never ask a worker or skeptic to run anything; have them produce edits and **static** evidence (code read, file:line, grep), and you run the verification after collecting their work. Static evidence is the verification currency here; runtime confirmation is a bonus only the root can supply.
 
@@ -43,7 +56,8 @@ Workers inherit none of your context. Each prompt must stand alone:
 
 ## Quality patterns (compose freely)
 
-- **Adversarial verification** — for each load-bearing finding, spawn a `skeptic` (read-only) to REFUTE it: "Try to refute this claim; default to refuted if the evidence doesn't hold." Paste the exact claim, its cited evidence, and the relevant code/diff **into the skeptic's prompt** — don't just point it at a file; a sub-agent under load may bail claiming it can't read, and an empty verdict reads as agreement. It can re-read to dig deeper, but give it the artifact up front. Discard findings a skeptic kills. A skeptic returns UNVERIFIABLE when a check needs running code it cannot execute — keep the finding, flag it unverified, and let the root confirm at runtime; never count a blocked check as refutation. Keep skeptic lenses **static** (correctness, security, caller-impact) — reproduction is the root's job, not a skeptic's. For high-stakes claims use 3 skeptics with distinct lenses and require a majority to survive. A finder grading its own work is theater; independence is the point.
+- **Adversarial verification** — for each load-bearing finding, spawn a `skeptic` (read-only) to REFUTE it: "Try to refute this claim; default to refuted if the evidence doesn't hold." Paste the exact claim, its cited evidence, and the relevant code/diff **into the skeptic's prompt** — don't just point it at a file; a sub-agent under load may bail claiming it can't read, and an empty verdict reads as agreement. It can re-read to dig deeper, but give it the artifact up front. Discard findings a skeptic kills. A skeptic returns UNVERIFIABLE when a check needs running code it cannot execute — keep the finding, flag it unverified, and let the root confirm at runtime; never count a blocked check as refutation. Keep skeptic lenses **static** (correctness, security, caller-impact, **contract** = exact filenames/CLI flags/install commands/public-API/doc accuracy — the small-detail failure class a refute-the-claim skeptic skips) — reproduction is the root's job, not a skeptic's. For high-stakes claims use 3 skeptics with distinct lenses and require a majority to survive. A finder grading its own work is theater; independence is the point.
+- **Don't call a parse check "proof"** — if the only thing that ran was `py_compile`/`tsc --noEmit`/a linter, that proves files parse, not that behavior is correct. Run the actual test suite before any "done"; otherwise report the requirement as *detected* (a check exists, unrun), not *verified*. Use the 5-state ledger taxonomy — verified / detected / inferred / needs-confirmation / unresolved — and never collapse them.
 - **Two-stage review** — for code-writing units: first spec compliance against the unit's task text (anything missing? anything extra? anything misread?), then code quality. Reviewers verify by **reading the diff** only — the root runs the acceptance test after approval. Issues go back to the same worker via `send_input`, re-review until approved, but **cap the loop at 2 rounds** — then escalate the unit to the root for command-level verification rather than looping.
 - **Loop until dry** — for unknown-size discovery (bugs, dead code, edge cases): rounds of finders, dedup against everything already seen, stop after 2 consecutive rounds find nothing new. Fixed counts miss the tail.
 - **Multi-angle sweep** — when one search angle won't find everything, run parallel agents each searching differently (by name, by content, by caller, by commit history), blind to each other.
@@ -72,3 +86,5 @@ For code changes, add one final gate before reporting, matched to what the chang
 - Runtime correctness → the **root** runs the suite/build (a skeptic cannot), or instruct the **user** to run `/review` (a slash command only the user can invoke; it executes at harness level).
 
 Lead with the verified conclusion. Then: what was swept (dimensions × agents), what survived verification vs was refuted, what failed, and what remains uncovered. Findings that failed adversarial verification are mentioned only as "checked and rejected" — never silently dropped.
+
+For non-trivial runs, leave a durable trail: the external harness writes `.codex/ultracode/runs/<id>/` (`run.json`, `results/`, `ledger.md`) via `start_run`/`save_result`/`write_ledger`. In-session, write the same ledger sections (Route / Scope / Findings / Changes / Verification / Adversarial gate / Unresolved risks / Next action) so the run is auditable and resumable.

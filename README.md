@@ -8,48 +8,48 @@ Bring **Claude-Code-style multi-agent orchestration** ("ultracode") to the **Ope
 
 | Path | What it is |
 |------|------------|
-| `skills/ultracode/SKILL.md` | The orchestration skill — triggers on `ultra`/`ultracode`. Scout → decompose → fan out → adversarially verify → synthesize, with role selection, wave/slot-reclaim mechanics, a budget brake, and partial-failure handling. |
+| `skills/ultracode/SKILL.md` | The orchestration skill — **explicit-only activation on the `$ultracode` token**. Phase 0 routing pre-flight → scout → fan out → adversarially verify → synthesize, with role selection, wave/slot-reclaim, a budget brake, and partial-failure handling. |
 | `skills/ultracode/agents/openai.yaml` | Skill display metadata. |
 | `agents/skeptic.toml` | A read-only "skeptic" agent role: tries to **refute** findings rather than confirm them (verdicts: `CONFIRMED` / `REFUTED` / `UNVERIFIABLE`). |
-| `orchestrator/codex_workflow.py` | A Python port of Claude Code's Workflow tool — `agent()` / `parallel()` / `pipeline()` over `codex exec` subprocesses, with schema validation, worktree isolation, a token budget, and a configurable concurrency. |
-| `orchestrator/codex_patterns.py` | The ultracode *methodology* as functions: `adversarial_verify`, `judge_panel`, `loop_until_dry`, `completeness_critic`, `review_then_verify`. |
+| `orchestrator/codex_workflow.py` | A Python port of Claude Code's Workflow tool — `agent()` / `parallel()` / `pipeline()` over `codex exec` subprocesses, with schema validation, worktree isolation, token budget, configurable concurrency, and a durable **run ledger** (`start_run`/`save_result`/`write_ledger`). |
+| `orchestrator/codex_patterns.py` | The ultracode *methodology*: `adversarial_verify` (static lenses incl. **contract**), `judge_panel`, `loop_until_dry`, `completeness_critic` (5-state), plus deterministic guards `verification_shallow` and `reingest_findings`. |
+| `scripts/install.py`, `scripts/check_package.py` | Cross-platform install/uninstall core and a behavioral package validator. |
+| `install.sh`, `install.ps1` | Thin wrappers: validate, then install. |
+| `docs/COMPARISON.md` | Honest head-to-head vs. `f1974939505/codex-ultracode-mode` — what each got right, what was adopted/rejected. |
 | `docs/workflow-in-codex.md` | How the external harness mirrors the Workflow tool, the four `codex exec` gotchas it handles, and a verified Codex-vs-Claude parity table. |
 | `docs/ultracode-test-plan.md` | A 30+ test plan covering trigger gating, orchestration, and the AGENTS.md rules. |
 | `docs/ultracode-codex-setup.md` | Setup guide and optional config upgrades. |
 | `docs/codex-ultracode-zh.html` | A detailed Chinese-language reference + gap analysis. |
-| `examples/AGENTS.md` | An example global `AGENTS.md` showing how to wire the `ultra` trigger into your behavioral file. |
+| `examples/AGENTS.md` | An example global `AGENTS.md` showing how to wire the `$ultracode` trigger into your behavioral file. |
 
 ## Install
 
 ```bash
-# 1. The skill
-mkdir -p ~/.codex/skills/ultracode/agents ~/.codex/agents
-cp skills/ultracode/SKILL.md          ~/.codex/skills/ultracode/SKILL.md
-cp skills/ultracode/agents/openai.yaml ~/.codex/skills/ultracode/agents/openai.yaml
-
-# 2. The adversarial-verifier role
-cp agents/skeptic.toml ~/.codex/agents/skeptic.toml
-
-# 3. Raise the in-session agent cap (default is 6). Back up your config first.
-#    Add to ~/.codex/config.toml:
-#      [agents]
-#      max_threads = 16        # no hard upper bound on the V1 multi-agent path
-
-# 4. (optional) the external harness for large fan-out
-pip install jsonschema        # enables strict schema validation in codex_workflow
+bash install.sh                 # validates the package, then installs the skill + skeptic role
+#   --dry-run        show what would happen, write nothing
+#   --uninstall      remove the skill + role
+#   --codex-home DIR target a non-default $CODEX_HOME
+# Windows: .\install.ps1
 ```
 
-Verify the skill loaded: `codex exec "List the skills available to you, names only."` → `ultracode` should appear.
+Then (manual, by design — it's your config) raise the in-session agent cap in `~/.codex/config.toml`:
+
+```toml
+[agents]
+max_threads = 16        # default 6; no hard upper bound on the V1 multi-agent path
+```
+
+For the external harness: `pip install jsonschema` enables strict schema validation. Verify the skill loaded: `codex exec "List the skills available to you, names only."` → `ultracode` should appear.
 
 ## Use
 
-In any Codex session (interactive or `codex exec`), prefix with the keyword:
+In any Codex session, invoke with the explicit token (bare "ultra"/"ultracode" or task wording does **not** trigger it — the cost-control guarantee):
 
 ```
-ultra: review the changes on this branch — find bugs, verify each finding with skeptics, report what survived
+$ultracode review the changes on this branch — find bugs, verify each finding with skeptics, report what survived
 ```
 
-Without the keyword, Codex works solo (the cost-control guarantee). For genuinely large, deterministic fan-out, drive the external harness instead:
+For genuinely large, deterministic fan-out, drive the external harness instead:
 
 ```python
 import codex_workflow as wf

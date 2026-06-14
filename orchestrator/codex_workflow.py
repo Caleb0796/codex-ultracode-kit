@@ -242,3 +242,47 @@ def pipeline(items, *stages):
                 return None
         return val
     return parallel([(lambda it=it, i=i: run_chain(it, i)) for i, it in enumerate(items)])
+
+
+# --- Durable run ledger: a human-auditable trail on disk -----------------------------
+# A real process orchestrator should leave the same audit trail an artifact-scaffolding
+# tool does. start_run() makes runs/<ts-sha>/; write_ledger() rewrites ledger.md
+# idempotently; save_result() drops a worker result for reingest_findings() to gate on.
+import hashlib
+import time
+
+RUNS_ROOT = os.environ.get("CODEX_WF_RUNS", os.path.join(CWD, ".codex", "ultracode", "runs"))
+
+
+def start_run(task, mode="auto"):
+    """Create runs/<timestamp>-<sha1(task)[:8]>/ with run.json + results/. Returns the dir."""
+    rid = time.strftime("%Y%m%d-%H%M%S") + "-" + hashlib.sha1(task.encode()).hexdigest()[:8]
+    d = os.path.join(RUNS_ROOT, rid)
+    os.makedirs(os.path.join(d, "results"), exist_ok=True)
+    with open(os.path.join(d, "run.json"), "w") as f:
+        json.dump({"run_id": rid, "task": task, "mode": mode,
+                   "started": time.strftime("%Y-%m-%dT%H:%M:%S")}, f, indent=2)
+    log(f"run dir: {d}")
+    return d
+
+
+def save_result(run_dir, item_id, result):
+    """Persist one worker/skeptic result as results/<item_id>.json (for reingest_findings)."""
+    p = os.path.join(run_dir, "results", f"{item_id}.json")
+    with open(p, "w") as f:
+        json.dump(result, f, indent=2)
+    return p
+
+
+def write_ledger(run_dir, sections):
+    """Idempotently (re)write ledger.md from {heading: body} — overwrites, never appends
+    duplicates. Conventional headings: Route, Scope, Findings, Changes, Verification,
+    Adversarial gate, Unresolved risks, Next action."""
+    order = ["Route", "Scope", "Findings", "Changes", "Verification",
+             "Adversarial gate", "Unresolved risks", "Next action"]
+    keys = [k for k in order if k in sections] + [k for k in sections if k not in order]
+    body = "# Ultracode run ledger\n\n" + "\n\n".join(
+        f"## {k}\n\n{sections[k]}" for k in keys)
+    with open(os.path.join(run_dir, "ledger.md"), "w") as f:
+        f.write(body + "\n")
+    return os.path.join(run_dir, "ledger.md")
