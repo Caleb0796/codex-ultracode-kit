@@ -8,11 +8,12 @@ Bring **Claude-Code-style multi-agent orchestration** ("ultracode") to the **Ope
 
 | Path | What it is |
 |------|------------|
-| `skills/ultracode/SKILL.md` | The orchestration skill — **explicit-only activation on the `$ultracode` token**. Phase 0 routing pre-flight → scout → fan out → adversarially verify → synthesize, with role selection, wave/slot-reclaim, a budget brake, and partial-failure handling. |
+| `skills/ultracode/SKILL.md` | The orchestration skill core — **explicit-only activation on the `$ultracode` token**. Phase 0 routing pre-flight (with scale-to-ask depth calibration) → scout → fan out → adversarially verify → synthesize. Kept under the 8 KB Codex loader cap. |
+| `skills/ultracode/reference.md` | The skill's long-form companion (read by the root on activation): worker-prompt rules, quality patterns (incl. barrier discipline), and concurrency/budget/effort mechanics. |
 | `skills/ultracode/agents/openai.yaml` | Skill display metadata. |
 | `agents/skeptic.toml` | A read-only "skeptic" agent role: tries to **refute** findings rather than confirm them (verdicts: `CONFIRMED` / `REFUTED` / `UNVERIFIABLE`). |
-| `orchestrator/codex_workflow.py` | A Python port of Claude Code's Workflow tool — `agent()` / `parallel()` / `pipeline()` over `codex exec` subprocesses, with schema validation, worktree isolation, token budget, configurable concurrency, and a durable **run ledger** (`start_run`/`save_result`/`write_ledger`). |
-| `orchestrator/codex_patterns.py` | The ultracode *methodology*: `adversarial_verify` (static lenses incl. **contract**), `judge_panel`, `loop_until_dry`, `completeness_critic` (5-state), plus deterministic guards `verification_shallow` and `reingest_findings`. |
+| `orchestrator/codex_workflow.py` | A Python port of Claude Code's Workflow tool — `agent()` / `parallel()` / `pipeline()` over `codex exec` subprocesses, with schema validation, worktree isolation (+ `apply_diff`), a **budget object** (`total`/`spent()`/`remaining()` for loop-until-budget), a **resume journal** (`CODEX_WF_RESUME`), runaway backstops (1000-agent lifetime cap, 4096-item cap), `phase()`/`label=` progress tags, and a durable **run ledger** (`start_run`/`save_result`/`write_ledger`). |
+| `orchestrator/codex_patterns.py` | The ultracode *methodology*: `adversarial_verify` (status-honest: refuted vs unverified), `judge_panel` (multi-judge + synthesis/grafting), `loop_until_dry` (logs caps), `multi_modal_sweep`, `completeness_critic` (5-state + gaps→next-round work), plus deterministic guards `verification_shallow` (fail-closed) and `reingest_findings`. |
 | `scripts/install.py`, `scripts/check_package.py` | Cross-platform install/uninstall core and a behavioral package validator. |
 | `install.sh`, `install.ps1` | Thin wrappers: validate, then install. |
 | `docs/COMPARISON.md` | Honest head-to-head vs. `f1974939505/codex-ultracode-mode` — what each got right, what was adopted/rejected. |
@@ -55,15 +56,24 @@ For genuinely large, deterministic fan-out, drive the external harness instead:
 import codex_workflow as wf
 import codex_patterns as cp
 
+# reviewers must return a top-level 'findings' array — verify() reads rev["findings"]
+FINDINGS_SCHEMA = {"type": "object", "properties": {"findings": {"type": "array", "items": {
+    "type": "object", "properties": {"file": {"type": "string"}, "line": {"type": "integer"},
+                                     "claim": {"type": "string"}}}}}}
+
 # one reviewer per dimension, each finding adversarially verified by independent skeptics;
 # pass run_dir to leave a durable audit trail (run.json + results/ + ledger.md on disk).
 run = wf.start_run("review module on 3 dimensions")
-confirmed = cp.review_then_verify(["correctness", "security", "perf"], FINDINGS, run_dir=run)
-# confirmed = findings that survived 3-lens (correctness/security/contract) refutation.
-# The ledger at run/ledger.md records Scope / Findings / Adversarial gate.
+confirmed = cp.review_then_verify(["correctness", "security", "perf"], FINDINGS_SCHEMA, run_dir=run)
+# confirmed = findings that survived 3-lens static refutation (the finding's own
+# dimension is used as a lens when it maps to one, e.g. perf). The ledger at
+# run/ledger.md records Scope / Coverage / Findings / Adversarial gate — and reports
+# dropped dimensions, skeptic failures, and budget exhaustion instead of a false clean pass.
 ```
 
-`CODEX_WF_CONCURRENCY`, `CODEX_WF_MODEL`, `CODEX_WF_EFFORT`, `CODEX_WF_TIMEOUT`, `CODEX_WF_BUDGET` (soft token cap), `CODEX_WF_CACHE` (=1 to replay identical calls), `CODEX_WF_RUNS`, `CODEX_WF_CWD` tune the harness.
+`CODEX_WF_CONCURRENCY`, `CODEX_WF_MODEL`, `CODEX_WF_EFFORT`, `CODEX_WF_TIMEOUT`, `CODEX_WF_BUDGET` (soft token ceiling — see `wf.budget.remaining()` for loop-until-budget), `CODEX_WF_MAX_AGENTS` (lifetime runaway cap, default 1000), `CODEX_WF_RESUME` (resume journal dir; read-only agents replay, refuses across a changed HEAD), `CODEX_WF_CACHE` (legacy read-only memoizer: `1` uses the default location next to `CODEX_WF_RUNS`, any other value is the cache dir; identical calls collapse — prefer `CODEX_WF_RESUME`), `CODEX_WF_RUNS`, `CODEX_WF_CWD` tune the harness.
+
+Parallel writers run via `agent(..., isolation="worktree")`: each gets a fresh git worktree and returns its diff. Land the diffs with `wf.apply_diff(diff)`, **then** call `wf.cleanup_worktrees()` — failure-path and no-change cleanup is automatic, success-path cleanup is yours.
 
 ## Three layers, by scale
 
@@ -78,7 +88,7 @@ confirmed = cp.review_then_verify(["correctness", "security", "perf"], FINDINGS,
 This kit was built and verified on **Codex CLI 0.125.0 / macOS / gpt-5.5**, in a setup where a managed policy forces approvals to **`OnRequest`**. Two consequences are baked into the skill:
 
 - **Sub-agents can edit files but cannot run shell commands** (tests/builds are auto-rejected in `exec` mode). So verification — running the suite — is the **root's** job, after collecting edits. If *your* Codex setup allows sub-agent command execution, the "Hard environment constraint" section of the skill is stricter than you need; relax it.
-- **`agents.max_threads` default is 6** and is the tree-wide concurrent cap. The skill assumes you've raised it (install step 3). `spawn_agents_on_csv` is clamped to it.
+- **`agents.max_threads` default is 6** and is the tree-wide concurrent cap. The skill assumes you've raised it (the manual `config.toml` step under Install above). `spawn_agents_on_csv` is clamped to it.
 
 ## Verification status
 

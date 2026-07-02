@@ -26,7 +26,7 @@ import codex_workflow as wf
 res = wf.parallel([lambda: wf.agent("...", schema=S), lambda: wf.agent("...", schema=S)])
 ```
 
-Knobs via env: `CODEX_WF_CONCURRENCY` (default 8), `CODEX_WF_MODEL`, `CODEX_WF_EFFORT`, `CODEX_WF_CWD`, `CODEX_WF_TIMEOUT`.
+Knobs via env: `CODEX_WF_CONCURRENCY` (default min(16, cores−2)), `CODEX_WF_MODEL`, `CODEX_WF_EFFORT`, `CODEX_WF_CWD`, `CODEX_WF_TIMEOUT`, `CODEX_WF_BUDGET`, `CODEX_WF_MAX_AGENTS`, `CODEX_WF_RESUME`, `CODEX_WF_CACHE`, `CODEX_WF_RUNS`.
 
 **Verified on this machine (Codex 0.125.0, 2026-06-13):**
 - 2 parallel schema agents → `[{'answer': 42}, {'answer': 72}]` — PASS
@@ -35,7 +35,7 @@ Knobs via env: `CODEX_WF_CONCURRENCY` (default 8), `CODEX_WF_MODEL`, `CODEX_WF_E
 
 This took a real bug fix to reach. The harness passed at 2 agents but hung at 8. Control tests proved Codex itself runs 8 concurrent `codex exec` fine (~22s), isolating the bug to the harness: `subprocess.run(capture_output=True)` pipes stdout/stderr, and `codex exec` emits enough banner/progress text that under concurrency the ~64KB OS pipe buffers fill and `subprocess.run` deadlocks. **Fix: redirect child output to a file, never a pipe** (the result comes from `-o` anyway). If you hand-roll your own orchestrator, do the same — this is the trap that makes "works at 2, hangs at 8."
 
-### Four real bugs found and fixed during testing
+### Five real bugs found and fixed during testing
 
 These are `codex exec` gotchas the harness now handles; you'd hit all of them hand-rolling it:
 
@@ -43,6 +43,7 @@ These are `codex exec` gotchas the harness now handles; you'd hit all of them ha
 2. **Strict schema.** OpenAI structured output requires `"additionalProperties": false` and all properties in `required` on *every* object, or you get `400 invalid_json_schema`. The harness auto-injects both — you write a normal JSON Schema.
 3. **MCP slows/breaks exec.** Every `codex exec` boots your configured MCP servers — startup cost × N agents, and `--output-schema` can misbehave when any MCP server is active. The harness passes `-c mcp_servers={}` to run clean.
 4. **`wait -n` needs bash ≥4.3; macOS ships 3.2.** That's why the harness uses a Python thread pool, not bash job control.
+5. **Notify hooks silently kill concurrent execs.** If your config has a notify/turn-ended hook, it can linger long after a run (~29 min observed) and was implicated in a silent exec death under parallel load. The harness passes `-c notify=[]` to every child. Do the same if you hand-roll.
 
 ## When to use which of the three layers
 
@@ -83,15 +84,15 @@ For parallel *writers*, give each task its own git worktree (so they don't colli
 
 An adversarial audit compared this harness feature-by-feature against the real Workflow tool. Verdict: the **engine and methodology now match; three harness-level features cannot be replicated with `codex exec`.**
 
-**Matched (core — the load-bearing 80%):** `agent` / `parallel` (barrier, allSettled→None) / `pipeline` (no barrier, `(prev,item,index)` stages, throw→None) / schema-validated structured output / concurrency cap. Plus `codex_patterns.py` ports the ultracode *methodology*: `adversarial_verify` (N skeptics refute, majority survives), `judge_panel`, `loop_until_dry`, `completeness_critic`, `review_then_verify`. The patterns are what make it "ultracode" rather than a parallel `map`.
+**Matched (core — the load-bearing 80%):** `agent` / `parallel` (barrier, allSettled→None) / `pipeline` (no barrier, `(prev,item,index)` stages, throw→None) / schema-validated structured output / concurrency cap (default min(16, cores−2)) / the runaway backstops (lifetime agent cap via `CODEX_WF_MAX_AGENTS`, default 1000; a 4096-item per-call cap that raises instead of truncating) / `phase()` + per-agent `label=` progress tags / the budget object (`wf.budget.total/spent()/remaining()` for loop-until-budget and fleet scaling; exhaustion raises `BudgetExceeded`, never retried, and batches report "BUDGET EXHAUSTED — N thunks did not run" distinctly from agent failures). Plus `codex_patterns.py` ports the ultracode *methodology*: `adversarial_verify` (N skeptics refute, majority survives; a dead skeptic is 'unverified', never a silent kill), `judge_panel` (multi-judge scores + synthesis grafting runners-up), `loop_until_dry` (logs when capped), `multi_modal_sweep`, `completeness_critic` (gaps become next-round work), `review_then_verify` (coverage-honest ledger). The patterns are what make it "ultracode" rather than a parallel `map`.
 
-**Filled after the audit caught them as defects in this harness:**
-- **Worktree isolation** for parallel writers — fresh worktree per agent, returns the diff; leak-proof on retry; cleans up worktrees *and* branches. (Verified: 2 writers, no collision.)
-- **Real schema validation** — was a buggy greedy `{.*}` regex with no validation; now balanced-brace parse + `jsonschema.validate` with retry-on-mismatch (true Workflow parity). Falls back gracefully if `jsonschema` isn't installed.
+**Filled after the audits caught them as defects in this harness:**
+- **Worktree isolation** for parallel writers — fresh worktree per agent, returns the diff; leak-proof on retry; a no-change worktree is removed immediately. (Verified: 2 writers, no collision.) The cleanup contract: failure-path and no-change cleanup is automatic; after **applying** diffs (use `wf.apply_diff(diff)` — empty-diff no-op, `--3way`, reports conflicted paths) call `wf.cleanup_worktrees()` yourself to remove the surviving worktrees *and* `cxwf/*` branches.
+- **Real schema validation** — was a buggy greedy `{.*}` regex with no validation; now escape-correct balanced-brace extraction that skips prose braces and validates candidates by parsing, + `jsonschema.validate` with retry-on-mismatch (true Workflow parity). Falls back gracefully if `jsonschema` isn't installed.
 - **Budget ceiling** — `CODEX_WF_BUDGET` token cap; `agent()` raises `BudgetExceeded` once exceeded (was a read-only meter).
+- **Resume** — `CODEX_WF_RESUME=<run dir>` journals every **read-only** agent result by content+occurrence: N identical redundant calls (independent skeptic votes) stay N distinct entries, an edited prompt hash-misses and runs live, and resuming after the repo's HEAD moved is refused (`CODEX_WF_RESUME_FORCE=1` overrides, loudly). Unlike Claude Code's prefix journal it does not auto-invalidate calls *after* an edited one — resume from the same HEAD or start a fresh run dir. Writer/worktree agents always run live: replaying a writer's text without re-applying its edits would silently return an empty diff, so the journal (and the legacy `CODEX_WF_CACHE` memoizer) covers read-only agents only.
 
 **Cannot be replicated (Claude Code *harness* features, not exposed by `codex exec`):**
-- **Resume / caching** (`resumeFromRunId`) — the script re-runs every agent; no cached-prefix replay. Biggest remaining gap for iterating on long runs. (Workaround: add your own content-hash disk cache for read-only agents.)
 - **Live background progress** — Workflow returns a runId, runs in background, streams a live tree (`/workflows`). The Python script blocks; closest is `nohup … &` + tailing `log()` output.
 - **MCP access for agents** — Workflow agents reach session MCP tools; this harness runs agents MCP-clean by default (`-c mcp_servers={}`) for speed/determinism. Audit caveat: that flag only *partially* suppresses configured servers (they still attempt to connect) — a deliberate divergence, not full parity.
 
@@ -100,5 +101,5 @@ An adversarial audit compared this harness feature-by-feature against the real W
 ## Realistic ceilings
 
 - **Per-job CSV hard cap: 64** concurrent workers (`MAX_AGENT_JOB_CONCURRENCY`), and only if `max_threads ≥ 64`.
-- **External harness: no hard cap** — but the real limit is your **API rate limits** (TPM/RPM) and RAM (~8-10 GB per agent that runs a dev server/tests). Lightweight read-only agents scale to dozens; heavy build/test agents top out at 3-5 on a laptop.
+- **External harness:** concurrency is your `CODEX_WF_CONCURRENCY`, with two runaway backstops (Workflow-tool parity): a **lifetime cap of 1000 agents** per process (`CODEX_WF_MAX_AGENTS`; `<=0` disables) and a **4096-item cap** per `parallel()`/`pipeline()` call that raises an explicit error rather than truncating. Below those, the real limit is your **API rate limits** (TPM/RPM) and RAM (~8-10 GB per agent that runs a dev server/tests). Lightweight read-only agents scale to dozens; heavy build/test agents top out at 3-5 on a laptop.
 - **Review capacity is the true bottleneck** at scale, not compute. Pin a finite N; never `xargs -P 0`.
