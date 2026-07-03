@@ -21,6 +21,24 @@ cp examples/AGENTS.md ~/.codex/AGENTS.md
 - Plain messages → normal solo Codex. No keyword, no token multiplier (sub-agent runs cost roughly N× tokens; the smoke test burned ~273K input tokens for a toy task, 76% cached).
 - For homogeneous fan-out ("do X for each of these 200 files"), use `$ultracode` and mention the list — the skill steers Codex to `spawn_agents_on_csv`.
 
+## In-session MCP front door (config snippet — your call, not auto-applied)
+
+`orchestrator/mcp_frontdoor.py` gives Codex sessions the Workflow-tool contract: fan-out tools that return a `run_id` immediately and run in the background, polled via `workflow_status(run_id)` — no more multi-minute blind tool calls. Register it (note `CODEX_WF_CODEX`: on machines where endpoint security kills the npm-installed codex binary, point at the Codex.app one):
+
+```toml
+[mcp_servers.ultracode]
+command = "python3"
+args = ["/path/to/codex-ultracode-kit/orchestrator/mcp_frontdoor.py"]
+startup_timeout_sec = 60.0
+tool_timeout_sec = 60.0        # tools return instantly; never a 30-minute blind wait
+
+[mcp_servers.ultracode.env]
+CODEX_WF_CODEX = "/Applications/Codex.app/Contents/Resources/codex"
+CODEX_WF_CWD = "/path/to/your/project"
+CODEX_WF_EFFORT = "medium"
+ULTRACODE_MAX_FANOUT = "6"
+```
+
 ## Worth adding next (config snippets — your call, not auto-applied)
 
 ```toml

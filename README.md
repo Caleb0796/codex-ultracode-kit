@@ -14,6 +14,8 @@ Bring **Claude-Code-style multi-agent orchestration** ("ultracode") to the **Ope
 | `agents/skeptic.toml` | A read-only "skeptic" agent role: tries to **refute** findings rather than confirm them (verdicts: `CONFIRMED` / `REFUTED` / `UNVERIFIABLE`). |
 | `orchestrator/codex_workflow.py` | A Python port of Claude Code's Workflow tool — `agent()` / `parallel()` / `pipeline()` over `codex exec` subprocesses, with schema validation, worktree isolation (+ `apply_diff`), a **budget object** (`total`/`spent()`/`remaining()` for loop-until-budget), a **resume journal** (`CODEX_WF_RESUME`), runaway backstops (1000-agent lifetime cap, 4096-item cap), `phase()`/`label=` progress tags, and a durable **run ledger** (`start_run`/`save_result`/`write_ledger`). |
 | `orchestrator/codex_patterns.py` | The ultracode *methodology*: `adversarial_verify` (status-honest: refuted vs unverified), `judge_panel` (multi-judge + synthesis/grafting), `loop_until_dry` (logs caps), `multi_modal_sweep`, `completeness_critic` (5-state + gaps→next-round work), plus deterministic guards `verification_shallow` (fail-closed) and `reingest_findings`. |
+| `orchestrator/mcp_frontdoor.py` | **In-session MCP front door** (zero-dependency stdio server): `ultracode_run` / `ultracode_review` / `ultracode_workflow` (saved workflows by name) return a `run_id` **immediately** and run in the background on the kit engine — poll `workflow_status(run_id)` or subscribe to the run's MCP resource for push updates; per-worker error text always captured. Parses "+500k" budget directives. Registration snippet in the module docstring. |
+| `orchestrator/workflows/` | Builtin **saved workflows** (`fanout`, `review`) for `wf.workflow(name, args)` / the `ultracode_workflow` tool; project workflows live in `.codex/ultracode/workflows/<name>.py` (a `run(args)` + optional `META`). |
 | `scripts/install.py`, `scripts/check_package.py` | Cross-platform install/uninstall core and a behavioral package validator. |
 | `install.sh`, `install.ps1` | Thin wrappers: validate, then install. |
 | `docs/COMPARISON.md` | Honest head-to-head vs. `f1974939505/codex-ultracode-mode` — what each got right, what was adopted/rejected. |
@@ -75,13 +77,14 @@ confirmed = cp.review_then_verify(["correctness", "security", "perf"], FINDINGS_
 
 Parallel writers run via `agent(..., isolation="worktree")`: each gets a fresh git worktree and returns its diff. Land the diffs with `wf.apply_diff(diff)`, **then** call `wf.cleanup_worktrees()` — failure-path and no-change cleanup is automatic, success-path cleanup is yours.
 
-## Three layers, by scale
+## Four layers, by scale
 
 | Need | Tool | Concurrency |
 |------|------|-------------|
 | In-session, model coordinates, a handful of agents | `spawn_agent` (the skill) | capped by `agents.max_threads` |
 | In-session homogeneous batch | `spawn_agents_on_csv` | `min(your value, 64, max_threads)` |
-| Dozens of agents, deterministic | `codex_workflow.py` (external) | **your N** — bounded by API rate limits / RAM |
+| In-session, deterministic N, background + progress | `mcp_frontdoor.py` (MCP tools) | `CODEX_WF_CONCURRENCY`, N ≤ `ULTRACODE_MAX_FANOUT` |
+| Dozens of agents, unattended/cross-repo | `codex_workflow.py` (external) | **your N** — bounded by API rate limits / RAM |
 
 ## Environment assumptions (read before relying on it)
 

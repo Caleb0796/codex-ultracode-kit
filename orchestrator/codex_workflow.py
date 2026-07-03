@@ -10,10 +10,16 @@ Primitives (Workflow-tool parity):
                             -> str|dict|worktree-dict
   parallel(thunks)          -> list   barrier; concurrent; failed thunk -> None
   pipeline(items, *stages)  -> list   per-item chains, no barrier
+  workflow(name|path, args) -> any    run a SAVED workflow (a .py defining run(args),
+                                      optional META header); shares this process's
+                                      caps, budget, and counters; one nesting level
+  meta(name=, description=, phases=)  self-describing run header: recorded in
+                                      run.json, phases auto-land in ledgers
   log(msg)                  -> None   progress line (mirrors Workflow log())
   phase(title)              -> None   progress grouping stamped into agent log tags
   budget                    -> obj    .total (None=off) / .spent() / .remaining()
   budget_exhausted()        -> bool   True once the ceiling stopped any agent
+  parse_budget_directive(t) -> int|None   "+500k" in a user message -> 500000
   tokens_used()             -> int    rough budget meter (parsed from codex output)
   apply_diff(diff)          -> dict   apply a worktree agent's diff onto the base repo
   cleanup_worktrees()       -> None   remove worktrees created by isolation='worktree'
@@ -24,6 +30,9 @@ NEW agents but cannot claw back in-flight spend, so leave headroom):
   fleet = int(wf.budget.total // 100_000) if wf.budget.total else 5  # fleet scaling
 
 Env knobs:
+  CODEX_WF_CODEX        path to the codex executable (default "codex" from PATH) — set it
+                        when the PATH shim is broken or endpoint security only allows a
+                        specific build (e.g. /Applications/Codex.app/Contents/Resources/codex)
   CODEX_WF_CONCURRENCY  max concurrent codex exec processes (default min(16, cores-2))
   CODEX_WF_MODEL        model for agents (default gpt-5.5)
   CODEX_WF_EFFORT       reasoning effort (default medium; per-agent via agent(effort=))
@@ -34,13 +43,23 @@ Env knobs:
   CODEX_WF_RESUME       run dir for the resume journal: read-only agent results replay by
                         content+occurrence; refuses across a changed HEAD unless
                         CODEX_WF_RESUME_FORCE=1. Writer/worktree agents always run live.
+  CODEX_WF_RESUME_MODE  "prefix" (default): the first journal miss switches the REST of
+                        the run live — an edited call invalidates everything after it
+                        (spec semantics); "content": pure content+occurrence replay
+  CODEX_WF_WORKFLOWS    saved-workflow dir (default $CWD/.codex/ultracode/workflows;
+                        names also resolve against the kit's orchestrator/workflows/)
+  CODEX_WF_SCHEMA_REPAIR "0" disables the one-shot repair call when an agent's output
+                        fails schema validation (default on: cheaper than a full re-run)
   CODEX_WF_CACHE        legacy idempotent memoizer for READ-ONLY agents ("1" or a dir);
                         identical calls collapse to one result and results go stale after
                         any repo mutation — prefer CODEX_WF_RESUME. "0"/"false"/"off" = off.
   CODEX_WF_RUNS         run-ledger root (default $CWD/.codex/ultracode/runs)
 """
+import ast
 import collections
+import contextvars
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -53,6 +72,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+CODEX_BIN = os.environ.get("CODEX_WF_CODEX", "codex")
 MODEL = os.environ.get("CODEX_WF_MODEL", "gpt-5.5")
 EFFORT = os.environ.get("CODEX_WF_EFFORT", "medium")
 CONCURRENCY = int(os.environ.get("CODEX_WF_CONCURRENCY",
@@ -80,7 +100,14 @@ _phase = [None]
 _phases = []
 _occ_lock = threading.Lock()
 _occ = collections.Counter()          # per-process occurrence index for resume replay
-_resume_state = {"checked": False, "error": None}  # error is STICKY — see _resume_slot
+_resume_state = {"checked": False, "error": None,  # error is STICKY — see _resume_slot
+                 "resuming": False}  # journal had prior entries at startup (vs fresh recording)
+_resume_live = [False]                # prefix mode: True after the first journal miss
+_meta_state = {}                      # meta() header, consumed by the next start_run()
+_wf_depth = contextvars.ContextVar("cxwf_depth", default=0)  # workflow() nesting guard;
+# parallel() propagates the caller's context into pool threads so the guard survives
+# the parallel()->workflow() path (a plain threading.local would reset to 0 there)
+_BUILTIN_WORKFLOWS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workflows")
 
 
 def _budget():
@@ -157,8 +184,139 @@ def phase(title):
 
 
 def phases():
-    """Phase titles seen so far — pass to write_ledger yourself if you want them recorded."""
+    """Phase titles seen so far — write_ledger also records them automatically."""
     return list(_phases)
+
+
+def meta(name=None, description=None, phases=None):
+    """Self-describing run header (Workflow-tool `meta` parity). Call before
+    start_run(): it is CONSUMED by the next start_run() (recorded into that run's
+    run.json, never leaking into later runs). Declared phases show up in the ledger
+    when run() never calls phase() itself. Saved workflows declare it as a
+    module-level META dict."""
+    _meta_state.clear()
+    _meta_state.update({k: v for k, v in (("name", name), ("description", description),
+                                          ("phases", phases)) if v is not None})
+
+
+_BUDGET_TOKEN = re.compile(r"^\+(\d+(?:\.\d+)?)([kKmM])?$")
+
+
+def parse_budget_directive(text):
+    """Parse a '+500k'-style token target out of a user message (Workflow-tool budget
+    directive parity): '+500k' -> 500000, '+1.5m' -> 1500000. To avoid firing on
+    incidental prose ('the diff adds +2k lines'), only a STANDALONE first or last
+    whitespace-token counts, and sub-1000 totals are ignored. Returns int or None."""
+    toks = (text or "").split()
+    if not toks:
+        return None
+    for tok in (toks[0], toks[-1]):
+        m = _BUDGET_TOKEN.match(tok)
+        if m:
+            mult = {"k": 1_000, "m": 1_000_000}.get((m.group(2) or "").lower(), 1)
+            val = int(float(m.group(1)) * mult)
+            if val >= 1000:
+                return val
+    return None
+
+
+_NONDET_EXACT = {"time.time", "time.time_ns", "time.monotonic", "datetime.datetime.now",
+                 "datetime.datetime.utcnow", "datetime.date.today", "uuid.uuid1",
+                 "uuid.uuid4", "os.urandom"}
+_NONDET_PREFIX = ("random.", "secrets.")
+
+
+def _lint_nondeterminism(src):
+    """AST-based determinism guard (spec parity for the Date.now/Math.random ban):
+    returns the offending dotted call name, or None. Resolves import aliases —
+    `from time import time; time()` is caught — and, being AST-based, never
+    false-positives on comments or strings."""
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None  # the module loader will surface the real error
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                aliases[a.asname or a.name.split(".")[0]] = a.name
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for a in node.names:
+                aliases[a.asname or a.name] = f"{node.module}.{a.name}"
+
+    def dotted(fn):
+        parts = []
+        while isinstance(fn, ast.Attribute):
+            parts.append(fn.attr)
+            fn = fn.value
+        if isinstance(fn, ast.Name):
+            parts.append(aliases.get(fn.id, fn.id))
+            return ".".join(reversed(parts))
+        return None
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = dotted(node.func)
+            if name and (name in _NONDET_EXACT
+                         or any(name.startswith(p) for p in _NONDET_PREFIX)):
+                return name
+    return None
+
+
+def _resolve_workflow(name_or_path):
+    """Resolve a saved-workflow name to its file: an explicit path wins, else
+    <CODEX_WF_WORKFLOWS>/<name>.py, else the kit's builtin orchestrator/workflows/."""
+    s = str(name_or_path)
+    if os.path.sep in s or s.endswith(".py"):
+        if os.path.isfile(s):
+            return s
+        raise ValueError(f"workflow file not found: {s}")
+    wdir = os.environ.get("CODEX_WF_WORKFLOWS",
+                          os.path.join(CWD, ".codex", "ultracode", "workflows"))
+    cand = [os.path.join(wdir, f"{s}.py"), os.path.join(_BUILTIN_WORKFLOWS, f"{s}.py")]
+    for p in cand:
+        if os.path.isfile(p):
+            return p
+    raise ValueError(f"workflow {s!r} not found (looked in: {', '.join(cand)})")
+
+
+def workflow(name_or_path, args=None):
+    """Run a SAVED workflow (Workflow-tool workflow() parity): a .py file defining
+    run(args) and optionally META = {'name','description','phases'}. It executes in
+    THIS process, so it shares the concurrency semaphore, agent counter, and token
+    budget by construction. One nesting level: a workflow calling workflow() raises.
+
+    Determinism guard (spec parity): under CODEX_WF_RESUME, a workflow whose source
+    CALLS time.time/datetime.now/random.*/uuid.uuid4/os.urandom (AST-resolved, so
+    `from time import time` is caught and comments never false-positive) is
+    REFUSED — nondeterministic prompt content breaks replay identity; pass
+    timestamps/seeds in via args."""
+    if _wf_depth.get() >= 1:
+        raise RuntimeError("workflow() nesting is limited to one level (Workflow-tool parity)")
+    path = _resolve_workflow(name_or_path)
+    src = open(path).read()
+    if os.environ.get("CODEX_WF_RESUME"):
+        bad = _lint_nondeterminism(src)
+        if bad:
+            raise RuntimeError(
+                f"workflow {os.path.basename(path)} calls {bad}() — nondeterministic "
+                f"values break resume replay identity; pass them via args")
+    spec = importlib.util.spec_from_file_location(
+        "cxwf_saved_" + _cache_key([os.path.realpath(path)])[:12], path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    if not callable(getattr(mod, "run", None)):
+        raise ValueError(f"workflow {path} must define run(args)")
+    m = getattr(mod, "META", None)
+    if isinstance(m, dict):
+        meta(m.get("name"), m.get("description"), m.get("phases"))
+        log(f"workflow: {m.get('name') or os.path.basename(path)}"
+            + (f" — {m['description']}" if m.get("description") else ""))
+    token = _wf_depth.set(_wf_depth.get() + 1)
+    try:
+        return mod.run(args)
+    finally:
+        _wf_depth.reset(token)
 
 
 def tokens_used():
@@ -304,6 +462,10 @@ def _resume_slot(prompt, schema, cwd, sandbox, model, effort):
         os.makedirs(jdir, exist_ok=True)
         if not _resume_state["checked"]:
             _resume_state["checked"] = True
+            # a journal with prior entries means we're RESUMING; a fresh dir is just
+            # recording, where first-time misses are normal and must not flip prefix mode
+            _resume_state["resuming"] = any(f.endswith(".json") and f != "meta.json"
+                                            for f in os.listdir(jdir))
             head = subprocess.run(["git", "-C", CWD, "rev-parse", "HEAD"],
                                   capture_output=True, text=True).stdout.strip()
             meta_p = os.path.join(jdir, "meta.json")
@@ -330,14 +492,29 @@ def _resume_slot(prompt, schema, cwd, sandbox, model, effort):
         return os.path.join(jdir, f"{h[:40]}-{_occ[h]}.json")
 
 
-def _run_once(prompt, schema, cwd, sandbox, model, effort, tag="", jkey=None):
+def _run_once(prompt, schema, cwd, sandbox, model, effort, tag="", jkey=None, _repair=False):
     # Replays first, budget second: a journal/cache hit spends zero new tokens, so an
     # exhausted budget must not discard results that were already paid for.
     # jkey is allocated ONCE in agent() (see _resume_slot) so retries reuse their slot.
-    if jkey and os.path.exists(jkey):
-        value, ok = _read_replay(jkey, "resume", tag)
-        if ok:
-            return value
+    if jkey:
+        prefix_mode = os.environ.get("CODEX_WF_RESUME_MODE", "prefix").strip().lower() != "content"
+        if prefix_mode and _resume_live[0]:
+            pass  # divergence already seen — prefix invalidated, run live (entry still written)
+        elif os.path.exists(jkey):
+            value, ok = _read_replay(jkey, "resume", tag)
+            if ok:
+                return value
+        elif prefix_mode and _resume_state["resuming"]:
+            # a miss while RESUMING = an edited/new call: spec semantics invalidate
+            # everything after it, so the REST of the run goes live (conservative under
+            # threads: wall-clock-after, never a stale replay). Misses during a fresh
+            # recording run are normal and never flip this.
+            with _occ_lock:
+                if not _resume_live[0]:
+                    _resume_live[0] = True
+                    log("resume: divergence detected — prefix invalidated, the rest of "
+                        "the run goes LIVE (CODEX_WF_RESUME_MODE=content for pure "
+                        "content replay)")
     # Legacy content-hash cache (read-only agents only — see _cache_dir).
     cdir = _cache_dir(sandbox)
     ckey = None
@@ -361,7 +538,7 @@ def _run_once(prompt, schema, cwd, sandbox, model, effort, tag="", jkey=None):
         # mcp_servers={} disables MCP: faster startup AND restores --output-schema, which codex
         # silently ignores when an MCP server is active (openai/codex#15451).
         cmd = [
-            "codex", "-a", "never", "-s", sandbox,
+            CODEX_BIN, "-a", "never", "-s", sandbox,
             "exec", "--skip-git-repo-check",
             "-c", f"model_reasoning_effort={effort or EFFORT}",
             "-c", "notify=[]",
@@ -378,9 +555,13 @@ def _run_once(prompt, schema, cwd, sandbox, model, effort, tag="", jkey=None):
         cmd.append(prompt)
         # Child output -> FILE, never PIPE: codex emits enough text that pipe buffers (~64KB)
         # fill under concurrency and subprocess.run deadlocks. The result comes from -o anyway.
+        # Child stdin -> DEVNULL, never inherited: codex READS stdin, and inside the MCP
+        # front door the inherited stdin IS the client's JSON-RPC pipe — a worker would
+        # steal protocol bytes mid-run and corrupt the session (found by live e2e).
         # _sem bounds the number of concurrent codex processes across all nesting levels.
         with open(logf, "w") as lf, _sem:
-            subprocess.run(cmd, check=True, stdout=lf, stderr=lf, timeout=TIMEOUT)
+            subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL,
+                           stdout=lf, stderr=lf, timeout=TIMEOUT)
         # rough token accounting from the codex footer. Require a leading digit (a bare
         # comma can't match) and take the LAST occurrence — the genuine footer is final,
         # so 'total 999999' in agent prose earlier in the log can't inflate the meter.
@@ -410,20 +591,41 @@ def _run_once(prompt, schema, cwd, sandbox, model, effort, tag="", jkey=None):
                 except json.JSONDecodeError:
                     raise ValueError(f"{tag}agent returned no parseable JSON "
                                      f"(first 200 chars): {text[:200]!r}")
-            # cheap root-type check even without jsonschema — a wrong-typed prose
-            # fragment must never be silently returned as the agent's result
-            if expect == "object" and not isinstance(result, dict):
-                raise ValueError(f"{tag}schema expects an object, agent returned "
-                                 f"{type(result).__name__}")
-            if expect == "array" and not isinstance(result, list):
-                raise ValueError(f"{tag}schema expects an array, agent returned "
-                                 f"{type(result).__name__}")
-            if _jsonschema is not None:
-                _jsonschema.validate(result, schema)  # raises -> caller's retry loop re-runs
+            try:
+                _validate_result(result, schema, expect, tag)
+            except Exception as ve:
+                # tool-call-layer retry parity: one cheap REPAIR pass (feed the invalid
+                # output + error back) instead of re-running the whole expensive agent;
+                # a failed repair raises into agent()'s normal retry loop
+                if _repair or os.environ.get("CODEX_WF_SCHEMA_REPAIR",
+                                             "1").strip().lower() in _CACHE_OFF:
+                    raise
+                log(f"{tag}schema validation failed — one repair pass ({str(ve)[:120]})")
+                result = _run_once(
+                    "Your previous output failed JSON-schema validation.\n"
+                    f"Validation error: {str(ve)[:400]}\n"
+                    f"Required schema: {json.dumps(schema)}\n"
+                    f"Your previous output: {json.dumps(result)[:2000]}\n"
+                    "Return ONLY the corrected JSON conforming to the schema — no prose.",
+                    schema, cwd, "read-only", model, effort,
+                    tag=tag + "repair: ", _repair=True)
         for path in (ckey, jkey):
             if path:
                 _atomic_write_json(path, {"value": result})
         return result
+
+
+def _validate_result(result, schema, expect, tag):
+    """Root-type check (works without jsonschema — a wrong-typed prose fragment must
+    never be silently returned) plus full jsonschema validation when available."""
+    if expect == "object" and not isinstance(result, dict):
+        raise ValueError(f"{tag}schema expects an object, agent returned "
+                         f"{type(result).__name__}")
+    if expect == "array" and not isinstance(result, list):
+        raise ValueError(f"{tag}schema expects an array, agent returned "
+                         f"{type(result).__name__}")
+    if _jsonschema is not None:
+        _jsonschema.validate(result, schema)
 
 
 # Subagent output is consumed by THIS script, not read by a human (Workflow-tool parity).
@@ -569,7 +771,9 @@ def parallel(thunks):
         return []
     results, stopped = [], 0
     with ThreadPoolExecutor(max_workers=max(1, min(CONCURRENCY * 2, len(thunks)))) as pool:
-        for f in [pool.submit(t) for t in thunks]:
+        # propagate the caller's context (one copy per thunk) so contextvars like the
+        # workflow() nesting guard survive into pool threads
+        for f in [pool.submit(contextvars.copy_context().run, t) for t in thunks]:
             try:
                 results.append(f.result())
             except BudgetExceeded:
@@ -623,9 +827,18 @@ def start_run(task, mode="auto"):
                     str(os.getpid()), os.urandom(2).hex()])
     d = os.path.join(RUNS_ROOT, rid)
     os.makedirs(os.path.join(d, "results"), exist_ok=True)
+    rec = {"run_id": rid, "task": task, "mode": mode,
+           "started": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    if _meta_state:
+        rec["meta"] = dict(_meta_state)  # meta() is CONSUMED by the run it describes
+        _meta_state.clear()              # — it must never leak into a later run
     with open(os.path.join(d, "run.json"), "w") as f:
-        json.dump({"run_id": rid, "task": task, "mode": mode,
-                   "started": time.strftime("%Y-%m-%dT%H:%M:%S")}, f, indent=2)
+        json.dump(rec, f, indent=2)
+    # a new run starts a fresh phase trail (phase()/meta() are process-scoped: in a
+    # multi-run process like the MCP front door, CONCURRENT runs still interleave —
+    # sequential runs no longer inherit each other's trail)
+    _phases[:] = []
+    _phase[0] = None
     log(f"run dir: {d}")
     return d
 
@@ -642,9 +855,23 @@ def save_result(run_dir, item_id, result):
 
 def write_ledger(run_dir, sections):
     """Idempotently (re)write ledger.md from {heading: body} — overwrites, never appends
-    duplicates. Conventional headings: Route, Scope, Coverage, Findings, Changes,
-    Verification, Adversarial gate, Unresolved risks, Next action."""
-    order = ["Route", "Scope", "Coverage", "Findings", "Changes", "Verification",
+    duplicates. Conventional headings: Route, Scope, Phases, Coverage, Findings, Changes,
+    Verification, Adversarial gate, Unresolved risks, Next action. Phase() titles are
+    recorded automatically when the caller doesn't supply a Phases section; if no
+    phase() ran, the run's DECLARED meta phases (run.json) stand in."""
+    if "Phases" not in sections:
+        trail = list(_phases)
+        if not trail:  # fall back to the phases the run DECLARED via meta()/META
+            try:
+                with open(os.path.join(run_dir, "run.json")) as f:
+                    trail = json.load(f).get("meta", {}).get("phases") or []
+            except (OSError, json.JSONDecodeError):
+                trail = []
+            trail = trail or list(_meta_state.get("phases") or [])
+        if trail:
+            sections = dict(sections)
+            sections["Phases"] = " → ".join(str(t) for t in trail)
+    order = ["Route", "Scope", "Phases", "Coverage", "Findings", "Changes", "Verification",
              "Adversarial gate", "Unresolved risks", "Next action"]
     keys = [k for k in order if k in sections] + [k for k in sections if k not in order]
     body = "# Ultracode run ledger\n\n" + "\n\n".join(

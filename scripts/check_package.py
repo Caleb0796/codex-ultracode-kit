@@ -32,7 +32,7 @@ def check(name, cond, detail=""):
 
 
 print("== py_compile orchestrator ==")
-for f in ("codex_workflow.py", "codex_patterns.py"):
+for f in ("codex_workflow.py", "codex_patterns.py", "mcp_frontdoor.py"):
     p = os.path.join(ROOT, "orchestrator", f)
     try:
         py_compile.compile(p, doraise=True)
@@ -85,16 +85,18 @@ print("== codex_workflow engine (offline) ==")
 sys.path.insert(0, os.path.join(ROOT, "orchestrator"))
 try:
     import codex_workflow as wf
-    for name in ("agent", "parallel", "pipeline", "log", "phase", "phases", "tokens_used",
-                 "budget", "budget_exhausted", "apply_diff", "cleanup_worktrees",
+    for name in ("agent", "parallel", "pipeline", "workflow", "meta", "log", "phase",
+                 "phases", "tokens_used", "budget", "budget_exhausted",
+                 "parse_budget_directive", "apply_diff", "cleanup_worktrees",
                  "start_run", "save_result", "write_ledger", "BudgetExceeded", "ResumeStale"):
         check(f"wf.{name} exists", hasattr(wf, name))
     src = open(os.path.join(ROOT, "orchestrator", "codex_workflow.py")).read()
     # match the actual env read, not the whole file — every knob name also appears
     # in the module docstring, which would make a bare substring check vacuous
-    for knob in ("CODEX_WF_CONCURRENCY", "CODEX_WF_MODEL", "CODEX_WF_EFFORT", "CODEX_WF_CWD",
-                 "CODEX_WF_TIMEOUT", "CODEX_WF_BUDGET", "CODEX_WF_MAX_AGENTS",
-                 "CODEX_WF_RESUME", "CODEX_WF_CACHE", "CODEX_WF_RUNS"):
+    for knob in ("CODEX_WF_CODEX", "CODEX_WF_CONCURRENCY", "CODEX_WF_MODEL", "CODEX_WF_EFFORT",
+                 "CODEX_WF_CWD", "CODEX_WF_TIMEOUT", "CODEX_WF_BUDGET", "CODEX_WF_MAX_AGENTS",
+                 "CODEX_WF_RESUME", "CODEX_WF_RESUME_MODE", "CODEX_WF_WORKFLOWS",
+                 "CODEX_WF_SCHEMA_REPAIR", "CODEX_WF_CACHE", "CODEX_WF_RUNS"):
         check(f"knob {knob} wired", f'os.environ.get("{knob}"' in src)
     # _extract_json: escaped quote + brace inside a string must not truncate
     check("_extract_json escaped-quote case",
@@ -164,8 +166,138 @@ try:
     check("CODEX_WF_CACHE=0 disables caching", wf._cache_dir("read-only") is None)
     os.environ.pop("CODEX_WF_CACHE", None)
     check("apply_diff('') is a no-op", wf.apply_diff("") == {"ok": True, "conflicts": [], "error": ""})
+    # budget directives (Workflow-tool '+500k' parity; standalone first/last token only)
+    check("parse_budget_directive trailing '+500k'", wf.parse_budget_directive("audit the repo +500k") == 500_000)
+    check("parse_budget_directive leading '+1.5m'", wf.parse_budget_directive("+1.5m go deep") == 1_500_000)
+    check("parse_budget_directive bare large number", wf.parse_budget_directive("go +20000") == 20_000)
+    check("parse_budget_directive ignores mid-prose '+2k'",
+          wf.parse_budget_directive("the diff adds +2k lines to review") is None)
+    check("parse_budget_directive ignores '+11'", wf.parse_budget_directive("fix +11") is None)
+    check("parse_budget_directive ignores sub-1k '+0.001k'", wf.parse_budget_directive("+0.001k") is None)
+    check("parse_budget_directive ignores C++14", wf.parse_budget_directive("port to C++14") is None)
+    check("parse_budget_directive none", wf.parse_budget_directive("no directive here") is None)
+    # determinism lint: AST-based — catches from-imports, never fires on comments
+    check("lint catches 'from time import time'",
+          wf._lint_nondeterminism("from time import time\ndef run(a):\n    return time()")
+          == "time.time")
+    check("lint ignores comments/strings",
+          wf._lint_nondeterminism("# never call time.time() here\ndef run(a):\n    return 1")
+          is None)
+    # saved-workflow registry: builtins resolve; unknown names raise; nesting guarded
+    check("builtin workflow 'fanout' resolves",
+          wf._resolve_workflow("fanout").endswith(os.path.join("workflows", "fanout.py")))
+    check("builtin workflow 'review' resolves",
+          wf._resolve_workflow("review").endswith(os.path.join("workflows", "review.py")))
+    try:
+        wf._resolve_workflow("no-such-workflow")
+        check("unknown workflow raises", False)
+    except ValueError:
+        check("unknown workflow raises", True)
+    _tok = wf._wf_depth.set(1)
+    try:
+        wf.workflow("fanout", {"task": "x"})
+        check("workflow() nesting guard raises", False)
+    except RuntimeError:
+        check("workflow() nesting guard raises", True)
+    finally:
+        wf._wf_depth.reset(_tok)
+    # determinism guard: nondeterministic workflow source refused under resume
+    _wdir = tempfile.mkdtemp()
+    open(os.path.join(_wdir, "nondet.py"), "w").write(
+        "import time\ndef run(args):\n    return time.time()\n")
+    os.environ["CODEX_WF_RESUME"] = tempfile.mkdtemp()
+    try:
+        wf.workflow(os.path.join(_wdir, "nondet.py"))
+        check("determinism guard refuses time.time under resume", False)
+    except RuntimeError as e:
+        check("determinism guard refuses time.time under resume", "resume replay" in str(e))
+    finally:
+        os.environ.pop("CODEX_WF_RESUME", None)
+    # meta contract: recorded in run.json, phases auto-land in ledgers
+    _runs_bak = wf.RUNS_ROOT
+    wf.RUNS_ROOT = tempfile.mkdtemp()
+    wf.meta(name="t-run", description="d", phases=["a", "b"])
+    wf._phases[:] = []
+    wf.phase("a")
+    _rd = wf.start_run("meta test")
+    check("meta lands in run.json",
+          json.load(open(os.path.join(_rd, "run.json"))).get("meta", {}).get("name") == "t-run")
+    wf.write_ledger(_rd, {"Scope": "x"})
+    check("phases auto-recorded in ledger", "## Phases" in open(os.path.join(_rd, "ledger.md")).read())
+    wf.RUNS_ROOT = _runs_bak
+    wf._meta_state.clear()
+    wf._phases[:] = []
+    wf._phase[0] = None
 except Exception as e:
     check("import/run codex_workflow", False, str(e))
+
+print("== mcp_frontdoor (offline) ==")
+try:
+    import mcp_frontdoor as fd
+    names = sorted(t["name"] for t in fd.TOOLS)
+    check("front door advertises the four tools",
+          names == ["ultracode_review", "ultracode_run", "ultracode_workflow",
+                    "workflow_status"])
+    check("front door declares resource subscriptions",
+          fd.CAPABILITIES.get("resources", {}).get("subscribe") is True)
+    check("unknown saved workflow -> tool error",
+          "error" in fd._call_tool("ultracode_workflow", {"name": "no-such-wf"}))
+    # budget grants are RELATIVE on the long-lived server: ceiling = meter + b, re-armable
+    import codex_workflow as _wf2
+    _env_bak = os.environ.pop("CODEX_WF_BUDGET", None)
+    _tok_bak, _wf2._tokens[0] = _wf2._tokens[0], 0
+    _ub_bak, fd._USER_BUDGET = fd._USER_BUDGET, False
+    try:
+        check("budget grant applies from task text",
+              fd._apply_budget_directive("do it +5k") == 5000
+              and os.environ["CODEX_WF_BUDGET"] == "5000")
+        _wf2._tokens[0] = 600_000
+        check("budget grant is relative to the meter and re-arms",
+              fd._apply_budget_directive("again +5k") == 5000
+              and os.environ["CODEX_WF_BUDGET"] == "605000")
+        fd._USER_BUDGET = True
+        check("user-configured ceiling never overridden",
+              fd._apply_budget_directive("more +9k") is None)
+    finally:
+        fd._USER_BUDGET = _ub_bak
+        _wf2._tokens[0] = _tok_bak
+        os.environ.pop("CODEX_WF_BUDGET", None)
+        if _env_bak is not None:
+            os.environ["CODEX_WF_BUDGET"] = _env_bak
+    # behavioral probe: the server must survive hostile stdin ('[]' batch) with runs alive
+    import subprocess as _sp
+    _p = _sp.Popen([sys.executable, os.path.join(ROOT, "orchestrator", "mcp_frontdoor.py")],
+                   stdin=_sp.PIPE, stdout=_sp.PIPE, stderr=_sp.DEVNULL, text=True)
+    try:
+        def _rpc(obj):
+            _p.stdin.write(json.dumps(obj) + "\n")
+            _p.stdin.flush()
+            return json.loads(_p.stdout.readline())
+        _init = _rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                      "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                                 "clientInfo": {"name": "v", "version": "0"}}})
+        check("server probe: initialize", "result" in _init)
+        _p.stdin.write("[]\n")
+        _p.stdin.flush()
+        _batch = json.loads(_p.stdout.readline())
+        check("server probe: '[]' rejected, not fatal", _batch.get("error", {}).get("code") == -32600)
+        _pong = _rpc({"jsonrpc": "2.0", "id": 2, "method": "ping"})
+        check("server probe: alive after hostile input", _pong.get("result") == {})
+    finally:
+        _p.stdin.close()
+        _p.wait(timeout=10)
+    check("fan-out tools promise IMMEDIATE run_id (async contract)",
+          all("IMMEDIATELY" in t["description"] for t in fd.TOOLS
+              if t["name"].startswith("ultracode_")))
+    check("workflow_status rejects path traversal",
+          fd._status("../../etc").get("found") is False)
+    check("workflow_status unknown id -> not found",
+          fd._status("1234567-abcdef").get("found") is False)
+    check("empty task rejected", fd._call_tool("ultracode_run", {"task": " "}) == {"error": "task is required"})
+    check("empty dimensions rejected",
+          "error" in fd._call_tool("ultracode_review", {"dimensions": []}))
+except Exception as e:
+    check("import/run mcp_frontdoor", False, str(e))
 
 print("== codex_patterns guards ==")
 try:
@@ -207,6 +339,22 @@ try:
         check("adversarial_verify rejects unreachable threshold", True)
     check("reingest fails on high-severity finding",
           _gate({"findings": [{"severity": "high", "claim": "x"}]})["gate"] == "fail")
+    check("reingest fails on BARE confirmed finding (review_then_verify shape)",
+          _gate({"file": "a.py", "claim": "off-by-one", "severity": "high",
+                 "dim": "correctness"})["gate"] == "fail")
+    # UNVERIFIABLE honesty: all-blocked votes must read 'unverified', never 'refuted'
+    _orig_parallel = cp.wf.parallel
+    try:
+        cp.wf.parallel = lambda thunks: [{"real": False, "unverifiable": True, "why": "blocked"}]
+        r = cp.adversarial_verify("claim x")
+        check("all-UNVERIFIABLE reads unverified (not refuted)",
+              r["survives"] is False and r["status"] == "unverified" and r["unverifiable"] == 1,
+              str(r))
+        cp.wf.parallel = lambda thunks: [{"real": False, "unverifiable": False, "why": "wrong"}]
+        r = cp.adversarial_verify("claim x")
+        check("live refutation still reads refuted", r["status"] == "refuted", str(r))
+    finally:
+        cp.wf.parallel = _orig_parallel
     d = tempfile.mkdtemp()
     open(os.path.join(d, "bad.json"), "w").write("{not json")
     check("reingest fails on invalid JSON result", cp.reingest_findings(d)["gate"] == "fail")

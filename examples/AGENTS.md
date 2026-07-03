@@ -73,6 +73,8 @@ If a patch could apply in more than one place, widen its context until it is uni
 
 When the user's message contains the literal token `$ultracode`, or the user explicitly asks to spawn parallel sub-agents, treat it as authorization for sub-agent delegation and parallel work: invoke the ultracode skill — run the Phase 0 routing pre-flight, fan out sub-agents (spawn_agent / spawn_agents_on_csv), adversarially verify load-bearing findings with independent read-only skeptics, then synthesize and report what was and wasn't covered. Do NOT trigger on bare "ultracode" (without the `$`), "ultra", or task wording like "ultra-thorough", "audit", "refactor", or "dynamic workflow" — those describe the task, not the activation. Without the token (or an explicit parallel-agent request), work solo.
 
+Standing toggle: if the project's AGENTS.md contains a line `ultracode: always`, treat every substantive task in that project as `$ultracode`-activated until the line is removed; a message containing `$ultracode-off` stays solo for that message only. Add or remove the toggle line only when the user asks, and — per the Safety section above — confirm before editing any AGENTS.md. Trivial/conversational turns stay solo even while the toggle is on.
+
 ## Final message
 
 Lead with the outcome: done, partially done, or blocked — and why. Then: what changed, how you verified it (commands and results) or that you couldn't, and any open items, assumptions, or skipped steps. No filler ("Great, I'll now..."), no play-by-play. No emojis unless asked. Reference code as `path/to/file.ts:42`. Label uncertainty explicitly ("I believe X but haven't verified it").

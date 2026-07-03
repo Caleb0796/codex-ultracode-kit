@@ -28,11 +28,14 @@ def install(home, dry):
     skill_dst = os.path.join(home, "skills", "ultracode")
     role_src = os.path.join(ROOT, "agents", "skeptic.toml")
     role_dst = os.path.join(home, "agents", "skeptic.toml")
-    for src in (skill_src, role_src):
+    orch_src = os.path.join(ROOT, "orchestrator")
+    orch_dst = os.path.join(skill_dst, "orchestrator")
+    for src in (skill_src, role_src, orch_src):
         if not os.path.exists(src):
             sys.exit(f"ERROR: missing source {src} — run from a complete checkout.")
     print(f"skill : {skill_src}  ->  {skill_dst}")
     print(f"role  : {role_src}  ->  {role_dst}")
+    print(f"engine: {orch_src}  ->  {orch_dst}  (the harness the skill escalates to)")
     if dry:
         print("(dry-run — nothing written)")
     else:
@@ -41,7 +44,8 @@ def install(home, dry):
         if os.path.exists(skill_dst):
             shutil.rmtree(skill_dst)              # idempotent: replace in place
         shutil.copytree(skill_src, skill_dst, ignore=_ignore)
-        shutil.copy2(role_src, role_dst)
+        shutil.copytree(orch_src, orch_dst, ignore=_ignore)  # inside the skill dir, so
+        shutil.copy2(role_src, role_dst)                     # uninstall cleans it too
         print("installed.")
     print("\nNext steps (manual, by design):")
     print("  1) Raise the in-session agent cap — add to your config.toml (back it up first):")

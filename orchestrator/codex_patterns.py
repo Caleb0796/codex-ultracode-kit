@@ -21,7 +21,8 @@ import codex_workflow as wf
 
 _VERDICT = {
     "type": "object",
-    "properties": {"real": {"type": "boolean"}, "why": {"type": "string"}},
+    "properties": {"real": {"type": "boolean"}, "unverifiable": {"type": "boolean"},
+                   "why": {"type": "string"}},
 }
 
 # Static lenses only — each is something a read-only skeptic can actually check.
@@ -44,10 +45,12 @@ def adversarial_verify(claim, lenses=("correctness",), threshold=None, evidence=
     finder grading its own work is theater. Paste the claim + its evidence INTO the
     prompt (don't make the skeptic hunt for it).
 
-    Returns {'survives','status','votes','failed'}. Gating is fail-closed (a dead
-    skeptic never counts as a confirmation), but `status` keeps the failure modes
-    honest: 'refuted' only when live refutations alone were decisive; 'unverified'
-    when failed skeptics could have flipped the outcome."""
+    Returns {'survives','status','votes','failed','unverifiable'}. Gating is
+    fail-closed (a dead or blocked skeptic never counts as a confirmation), but
+    `status` keeps the failure modes honest: 'refuted' only when live actual
+    refutations were decisive; 'unverified' when dead skeptics OR sandbox-blocked
+    (UNVERIFIABLE) votes could have flipped the outcome — an unverifiable claim is
+    kept-but-flagged for the root to confirm at runtime, never reported as refuted."""
     if not lenses:
         raise ValueError("adversarial_verify requires at least one lens")
     if threshold is None:
@@ -62,21 +65,25 @@ def adversarial_verify(claim, lenses=("correctness",), threshold=None, evidence=
             f"You are independent skeptic {j + 1} of {n}.\n"
             f"Adversarially verify this claim through the {lens} lens "
             f"({LENSES.get(lens, lens)}). Try to REFUTE it; default to real=false if the "
-            f"evidence does not clearly hold. If confirming would require running code you "
-            f"cannot run, say so in `why` and return real=false (UNVERIFIABLE is not a pass)."
+            f"evidence does not clearly hold. If your check is BLOCKED — confirming would "
+            f"require running code you cannot run — return real=false AND unverifiable=true "
+            f"with the blocked step in `why` (UNVERIFIABLE is not a pass, but it is not a "
+            f"refutation either); otherwise unverifiable=false."
             f"\n\nClaim: {claim}\n\nEvidence:\n{evidence or '(none supplied — reason from the repo)'}",
             schema=_VERDICT, role="skeptic", label=f"skeptic:{lens}"))
         for j, lens in enumerate(lenses)
     ])
     real = [v for v in votes if v and v.get("real")]
     failed = sum(1 for v in votes if v is None)
+    blocked = sum(1 for v in votes if v and not v.get("real") and v.get("unverifiable"))
     survives = len(real) >= threshold
     status = "confirmed" if survives else (
-        "unverified" if len(real) + failed >= threshold else "refuted")
-    if failed:
-        wf.log(f"adversarial_verify: {failed}/{len(votes)} skeptics failed (agent error), "
-               f"status={status}")
-    return {"survives": survives, "status": status, "votes": votes, "failed": failed}
+        "unverified" if len(real) + failed + blocked >= threshold else "refuted")
+    if failed or (blocked and not survives):
+        wf.log(f"adversarial_verify: {failed} dead skeptic(s), {blocked} UNVERIFIABLE "
+               f"vote(s) — status={status}")
+    return {"survives": survives, "status": status, "votes": votes, "failed": failed,
+            "unverifiable": blocked}
 
 
 def judge_panel(task, approaches, schema=None, n_judges=1, synthesize=True):
@@ -303,6 +310,12 @@ def reingest_findings(results_dir):
             if str(r.get("status", "")).lower() in ("fail", "failed", "blocked"):
                 blocking.append({"file": os.path.basename(path), "severity": "high",
                                  "claim": f"worker status={r.get('status')}: {str(r.get('summary', ''))[:160]}"})
+            # a record that IS a finding (review_then_verify saves confirmed findings
+            # as bare dicts) — a confirmed high-severity finding must block the gate
+            if str(r.get("severity", "")).lower() in ("critical", "high") \
+                    and ("claim" in r or "title" in r):
+                blocking.append({"file": os.path.basename(path), "severity": r.get("severity"),
+                                 "claim": str(r.get("claim") or r.get("title"))[:160]})
             # completeness_critic output: anything not all-verified blocks the gate
             if r.get("all_verified") is False:
                 unmet = [q.get("requirement", "?") for q in (r.get("requirements") or [])
